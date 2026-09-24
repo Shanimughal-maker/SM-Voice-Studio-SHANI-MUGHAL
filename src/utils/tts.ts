@@ -37,6 +37,54 @@ export const GEMINI_VOICES = [
 ] as const;
 
 export type GeminiVoice = (typeof GEMINI_VOICES)[number];
+export type VoiceGender = "Male" | "Female";
+
+export interface VoiceMetadata {
+  name: GeminiVoice;
+  gender: VoiceGender;
+  character: string;
+  label: string;
+}
+
+export const VOICE_METADATA: Record<GeminiVoice, VoiceMetadata> = {
+  // Male (16)
+  Puck: { name: "Puck", gender: "Male", character: "Upbeat", label: "Puck — Male, Upbeat" },
+  Charon: { name: "Charon", gender: "Male", character: "Informative", label: "Charon — Male, Informative" },
+  Fenrir: { name: "Fenrir", gender: "Male", character: "Excitable", label: "Fenrir — Male, Excitable" },
+  Orus: { name: "Orus", gender: "Male", character: "Firm", label: "Orus — Male, Firm" },
+  Enceladus: { name: "Enceladus", gender: "Male", character: "Breathy", label: "Enceladus — Male, Breathy" },
+  Iapetus: { name: "Iapetus", gender: "Male", character: "Clear", label: "Iapetus — Male, Clear" },
+  Umbriel: { name: "Umbriel", gender: "Male", character: "Easy-going", label: "Umbriel — Male, Easy-going" },
+  Algenib: { name: "Algenib", gender: "Male", character: "Gravelly", label: "Algenib — Male, Gravelly" },
+  Algieba: { name: "Algieba", gender: "Male", character: "Smooth", label: "Algieba — Male, Smooth" },
+  Schedar: { name: "Schedar", gender: "Male", character: "Even", label: "Schedar — Male, Even" },
+  Achird: { name: "Achird", gender: "Male", character: "Friendly", label: "Achird — Male, Friendly" },
+  Zubenelgenubi: { name: "Zubenelgenubi", gender: "Male", character: "Casual", label: "Zubenelgenubi — Male, Casual" },
+  Sadachbia: { name: "Sadachbia", gender: "Male", character: "Lively", label: "Sadachbia — Male, Lively" },
+  Sadaltager: { name: "Sadaltager", gender: "Male", character: "Knowledgeable", label: "Sadaltager — Male, Knowledgeable" },
+  Alnilam: { name: "Alnilam", gender: "Male", character: "Firm", label: "Alnilam — Male, Firm" },
+  Rasalgethi: { name: "Rasalgethi", gender: "Male", character: "Informative", label: "Rasalgethi — Male, Informative" },
+
+  // Female (14)
+  Zephyr: { name: "Zephyr", gender: "Female", character: "Bright", label: "Zephyr — Female, Bright" },
+  Kore: { name: "Kore", gender: "Female", character: "Firm", label: "Kore — Female, Firm" },
+  Leda: { name: "Leda", gender: "Female", character: "Youthful", label: "Leda — Female, Youthful" },
+  Aoede: { name: "Aoede", gender: "Female", character: "Breezy", label: "Aoede — Female, Breezy" },
+  Callirrhoe: { name: "Callirrhoe", gender: "Female", character: "Easy-going", label: "Callirrhoe — Female, Easy-going" },
+  Autonoe: { name: "Autonoe", gender: "Female", character: "Bright", label: "Autonoe — Female, Bright" },
+  Despina: { name: "Despina", gender: "Female", character: "Smooth", label: "Despina — Female, Smooth" },
+  Erinome: { name: "Erinome", gender: "Female", character: "Clear", label: "Erinome — Female, Clear" },
+  Laomedeia: { name: "Laomedeia", gender: "Female", character: "Upbeat", label: "Laomedeia — Female, Upbeat" },
+  Achernar: { name: "Achernar", gender: "Female", character: "Soft", label: "Achernar — Female, Soft" },
+  Gacrux: { name: "Gacrux", gender: "Female", character: "Mature", label: "Gacrux — Female, Mature" },
+  Pulcherrima: { name: "Pulcherrima", gender: "Female", character: "Forward", label: "Pulcherrima — Female, Forward" },
+  Vindemiatrix: { name: "Vindemiatrix", gender: "Female", character: "Gentle", label: "Vindemiatrix — Female, Gentle" },
+  Sulafat: { name: "Sulafat", gender: "Female", character: "Warm", label: "Sulafat — Female, Warm" },
+};
+
+export const getVoiceLabel = (voice: GeminiVoice): string => {
+  return VOICE_METADATA[voice]?.label || `${voice}`;
+};
 
 export const TEXT_MODEL = "gemini-3.6-flash";
 

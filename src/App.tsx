@@ -13,6 +13,8 @@ import {
   VOICE_STYLES,
   PACES,
   PREVIEW_SAMPLES,
+  VOICE_METADATA,
+  getVoiceLabel,
   buildPayload,
   splitSingleSpeakerScript,
   splitTwoSpeakerScript,
@@ -167,14 +169,90 @@ export default function App() {
   // Single vs Two-speaker mode
   const [isTwoSpeaker, setIsTwoSpeaker] = useState<boolean>(false);
   const [singleVoice, setSingleVoice] = useState<GeminiVoice>("Charon");
+  const [genderFilter, setGenderFilter] = useState<"All" | "Male" | "Female">("All");
+
   const [speaker1, setSpeaker1] = useState<{ name: string; voice: GeminiVoice }>({
     name: "Speaker1",
     voice: "Charon",
   });
+  const [speaker1GenderFilter, setSpeaker1GenderFilter] = useState<"All" | "Male" | "Female">("All");
+
   const [speaker2, setSpeaker2] = useState<{ name: string; voice: GeminiVoice }>({
     name: "Speaker2",
     voice: "Aoede",
   });
+  const [speaker2GenderFilter, setSpeaker2GenderFilter] = useState<"All" | "Male" | "Female">("All");
+
+  // Filtered voice lists based on gender filter
+  const filteredVoices = useMemo(() => {
+    if (genderFilter === "All") return GEMINI_VOICES;
+    return GEMINI_VOICES.filter(
+      (v) => VOICE_METADATA[v]?.gender === genderFilter
+    );
+  }, [genderFilter]);
+
+  const speaker1FilteredVoices = useMemo(() => {
+    if (speaker1GenderFilter === "All") return GEMINI_VOICES;
+    return GEMINI_VOICES.filter(
+      (v) => VOICE_METADATA[v]?.gender === speaker1GenderFilter
+    );
+  }, [speaker1GenderFilter]);
+
+  const speaker2FilteredVoices = useMemo(() => {
+    if (speaker2GenderFilter === "All") return GEMINI_VOICES;
+    return GEMINI_VOICES.filter(
+      (v) => VOICE_METADATA[v]?.gender === speaker2GenderFilter
+    );
+  }, [speaker2GenderFilter]);
+
+  const handleGenderFilterChange = (newGender: "All" | "Male" | "Female") => {
+    setGenderFilter(newGender);
+    if (newGender !== "All") {
+      const currentInfo = VOICE_METADATA[singleVoice];
+      if (currentInfo && currentInfo.gender !== newGender) {
+        const firstMatch = GEMINI_VOICES.find(
+          (v) => VOICE_METADATA[v]?.gender === newGender
+        );
+        if (firstMatch) {
+          setSingleVoice(firstMatch);
+        }
+      }
+    }
+  };
+
+  const handleSpeaker1GenderFilterChange = (
+    newGender: "All" | "Male" | "Female"
+  ) => {
+    setSpeaker1GenderFilter(newGender);
+    if (newGender !== "All") {
+      const currentInfo = VOICE_METADATA[speaker1.voice];
+      if (currentInfo && currentInfo.gender !== newGender) {
+        const firstMatch = GEMINI_VOICES.find(
+          (v) => VOICE_METADATA[v]?.gender === newGender
+        );
+        if (firstMatch) {
+          setSpeaker1((prev) => ({ ...prev, voice: firstMatch }));
+        }
+      }
+    }
+  };
+
+  const handleSpeaker2GenderFilterChange = (
+    newGender: "All" | "Male" | "Female"
+  ) => {
+    setSpeaker2GenderFilter(newGender);
+    if (newGender !== "All") {
+      const currentInfo = VOICE_METADATA[speaker2.voice];
+      if (currentInfo && currentInfo.gender !== newGender) {
+        const firstMatch = GEMINI_VOICES.find(
+          (v) => VOICE_METADATA[v]?.gender === newGender
+        );
+        if (firstMatch) {
+          setSpeaker2((prev) => ({ ...prev, voice: firstMatch }));
+        }
+      }
+    }
+  };
 
   // Script text in Studio tab
   const [scriptText, setScriptText] = useState<string>("");
@@ -1044,22 +1122,44 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                     <div className="sm:col-span-8 space-y-1.5">
                       <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
                         <Volume2 className="w-3.5 h-3.5 text-amber-400" />
-                        Gemini Voice ({GEMINI_VOICES.length} available)
+                        Gemini Voice ({filteredVoices.length} available)
                       </label>
-                      <select
-                        value={singleVoice}
-                        onChange={(e) =>
-                          setSingleVoice(e.target.value as GeminiVoice)
-                        }
-                        disabled={isGenerating}
-                        className="w-full bg-[#0d1220] border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-amber-500/60 transition-colors cursor-pointer"
-                      >
-                        {GEMINI_VOICES.map((v) => (
-                          <option key={v} value={v}>
-                            {v}
-                          </option>
-                        ))}
-                      </select>
+                      <div className="flex items-center gap-2">
+                        <select
+                          value={singleVoice}
+                          onChange={(e) =>
+                            setSingleVoice(e.target.value as GeminiVoice)
+                          }
+                          disabled={isGenerating}
+                          className="flex-1 min-w-0 bg-[#0d1220] border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-amber-500/60 transition-colors cursor-pointer"
+                        >
+                          {filteredVoices.map((v) => (
+                            <option key={v} value={v}>
+                              {getVoiceLabel(v)}
+                            </option>
+                          ))}
+                        </select>
+
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                            Gender:
+                          </span>
+                          <select
+                            value={genderFilter}
+                            onChange={(e) =>
+                              handleGenderFilterChange(
+                                e.target.value as "All" | "Male" | "Female"
+                              )
+                            }
+                            disabled={isGenerating}
+                            className="bg-[#0d1220] border border-slate-800 rounded-lg px-2.5 py-2 text-xs text-slate-100 focus:outline-none focus:border-amber-500/60 transition-colors cursor-pointer"
+                          >
+                            <option value="All">All</option>
+                            <option value="Male">Male</option>
+                            <option value="Female">Female</option>
+                          </select>
+                        </div>
+                      </div>
                     </div>
 
                     <div className="sm:col-span-4 flex flex-col items-end gap-1">
@@ -1113,22 +1213,44 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                           placeholder="Speaker1 label"
                           className="w-full bg-[#0d1220] border border-slate-800 rounded-md px-2 py-1 text-xs text-slate-200"
                         />
-                        <select
-                          value={speaker1.voice}
-                          onChange={(e) =>
-                            setSpeaker1({
-                              ...speaker1,
-                              voice: e.target.value as GeminiVoice,
-                            })
-                          }
-                          className="w-full bg-[#0d1220] border border-slate-800 rounded-md px-2 py-1 text-xs text-slate-200"
-                        >
-                          {GEMINI_VOICES.map((v) => (
-                            <option key={v} value={v}>
-                              {v}
-                            </option>
-                          ))}
-                        </select>
+                        <div className="flex items-center gap-2">
+                          <select
+                            value={speaker1.voice}
+                            onChange={(e) =>
+                              setSpeaker1({
+                                ...speaker1,
+                                voice: e.target.value as GeminiVoice,
+                              })
+                            }
+                            disabled={isGenerating}
+                            className="flex-1 min-w-0 bg-[#0d1220] border border-slate-800 rounded-md px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-amber-500/60 cursor-pointer"
+                          >
+                            {speaker1FilteredVoices.map((v) => (
+                              <option key={v} value={v}>
+                                {getVoiceLabel(v)}
+                              </option>
+                            ))}
+                          </select>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <span className="text-[10px] text-slate-400 uppercase font-semibold">
+                              Gender:
+                            </span>
+                            <select
+                              value={speaker1GenderFilter}
+                              onChange={(e) =>
+                                handleSpeaker1GenderFilterChange(
+                                  e.target.value as "All" | "Male" | "Female"
+                                )
+                              }
+                              disabled={isGenerating}
+                              className="bg-[#0d1220] border border-slate-800 rounded px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-amber-500/60 cursor-pointer"
+                            >
+                              <option value="All">All</option>
+                              <option value="Male">Male</option>
+                              <option value="Female">Female</option>
+                            </select>
+                          </div>
+                        </div>
                       </div>
 
                       {/* Speaker 2 */}
@@ -1145,22 +1267,44 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                           placeholder="Speaker2 label"
                           className="w-full bg-[#0d1220] border border-slate-800 rounded-md px-2 py-1 text-xs text-slate-200"
                         />
-                        <select
-                          value={speaker2.voice}
-                          onChange={(e) =>
-                            setSpeaker2({
-                              ...speaker2,
-                              voice: e.target.value as GeminiVoice,
-                            })
-                          }
-                          className="w-full bg-[#0d1220] border border-slate-800 rounded-md px-2 py-1 text-xs text-slate-200"
-                        >
-                          {GEMINI_VOICES.map((v) => (
-                            <option key={v} value={v}>
-                              {v}
-                            </option>
-                          ))}
-                        </select>
+                        <div className="flex items-center gap-2">
+                          <select
+                            value={speaker2.voice}
+                            onChange={(e) =>
+                              setSpeaker2({
+                                ...speaker2,
+                                voice: e.target.value as GeminiVoice,
+                              })
+                            }
+                            disabled={isGenerating}
+                            className="flex-1 min-w-0 bg-[#0d1220] border border-slate-800 rounded-md px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-amber-500/60 cursor-pointer"
+                          >
+                            {speaker2FilteredVoices.map((v) => (
+                              <option key={v} value={v}>
+                                {getVoiceLabel(v)}
+                              </option>
+                            ))}
+                          </select>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <span className="text-[10px] text-slate-400 uppercase font-semibold">
+                              Gender:
+                            </span>
+                            <select
+                              value={speaker2GenderFilter}
+                              onChange={(e) =>
+                                handleSpeaker2GenderFilterChange(
+                                  e.target.value as "All" | "Male" | "Female"
+                                )
+                              }
+                              disabled={isGenerating}
+                              className="bg-[#0d1220] border border-slate-800 rounded px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-amber-500/60 cursor-pointer"
+                            >
+                              <option value="All">All</option>
+                              <option value="Male">Male</option>
+                              <option value="Female">Female</option>
+                            </select>
+                          </div>
+                        </div>
                       </div>
                     </div>
 
