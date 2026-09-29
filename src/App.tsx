@@ -53,6 +53,8 @@ import {
   ShieldCheck,
   AlertCircle,
   X,
+  Lock,
+  Unlock,
 } from "lucide-react";
 
 export default function App() {
@@ -60,6 +62,49 @@ export default function App() {
   useEffect(() => {
     document.title = "SM Voice Studio — SHANI MUGHAL";
   }, []);
+
+  // Access Lock Passcode
+  const APP_ACCESS_PASSCODE = "Shani Mughal From Sargodha";
+  const [isUnlocked, setIsUnlocked] = useState<boolean>(() => {
+    try {
+      return (
+        sessionStorage.getItem("sm_app_unlocked") === "true" ||
+        localStorage.getItem("sm_app_unlocked") === "true"
+      );
+    } catch {
+      return false;
+    }
+  });
+  const [passcodeAttempt, setPasscodeAttempt] = useState<string>("");
+  const [passcodeError, setPasscodeError] = useState<string | null>(null);
+  const [rememberUnlock, setRememberUnlock] = useState<boolean>(false);
+  const [showPasscodeText, setShowPasscodeText] = useState<boolean>(false);
+
+  const handleUnlockApp = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (passcodeAttempt.trim() === APP_ACCESS_PASSCODE) {
+      setIsUnlocked(true);
+      setPasscodeError(null);
+      try {
+        sessionStorage.setItem("sm_app_unlocked", "true");
+        if (rememberUnlock) {
+          localStorage.setItem("sm_app_unlocked", "true");
+        }
+      } catch {}
+    } else {
+      setPasscodeError("Invalid passcode! Access denied. Enter the correct lock key.");
+    }
+  };
+
+  const handleLockApp = () => {
+    try {
+      sessionStorage.removeItem("sm_app_unlocked");
+      localStorage.removeItem("sm_app_unlocked");
+    } catch {}
+    setIsUnlocked(false);
+    setPasscodeAttempt("");
+    setPasscodeError(null);
+  };
 
   // Active tab: 'studio' | 'translate'
   const [activeTab, setActiveTab] = useState<"studio" | "translate">("studio");
@@ -751,6 +796,108 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
     }
   };
 
+  if (!isUnlocked) {
+    return (
+      <div className="min-h-screen bg-[#090d16] text-slate-200 flex flex-col justify-between selection:bg-amber-500/30 selection:text-amber-200 relative overflow-hidden">
+        {/* Background ambient lighting */}
+        <div className="fixed inset-0 pointer-events-none overflow-hidden">
+          <div className="absolute -top-40 left-1/2 -translate-x-1/2 w-[700px] h-[350px] bg-amber-500/10 rounded-full blur-3xl" />
+          <div className="absolute bottom-10 -right-40 w-[500px] h-[500px] bg-amber-600/5 rounded-full blur-3xl" />
+        </div>
+
+        <div className="relative z-10 flex-1 flex items-center justify-center p-4 sm:p-6">
+          <div className="w-full max-w-md bg-[#0a0e1a]/95 border border-slate-800/90 rounded-2xl p-6 sm:p-8 shadow-2xl backdrop-blur-md">
+            <div className="text-center mb-6">
+              <div className="w-14 h-14 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400 mb-3.5 mx-auto shadow-lg shadow-amber-500/10">
+                <Lock className="w-7 h-7 text-amber-400" />
+              </div>
+              <h1 className="font-cinematic text-2xl sm:text-3xl font-bold tracking-wide text-transparent bg-clip-text bg-gradient-to-r from-amber-200 via-amber-400 to-amber-100">
+                SM Voice Studio
+              </h1>
+              <p className="text-xs uppercase tracking-widest text-amber-500/90 font-medium mt-1">
+                Developed by SHANI MUGHAL
+              </p>
+              <div className="mt-4 p-3 rounded-xl bg-slate-900/60 border border-slate-800/80">
+                <p className="text-xs text-slate-300 leading-relaxed">
+                  Yeh web app password protected hai. Access hasil karne k liye lock passcode darj karein.
+                </p>
+              </div>
+            </div>
+
+            <form onSubmit={handleUnlockApp} className="space-y-4">
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+                  Access Passcode
+                </label>
+                <div className="relative">
+                  <input
+                    type={showPasscodeText ? "text" : "password"}
+                    value={passcodeAttempt}
+                    onChange={(e) => {
+                      setPasscodeAttempt(e.target.value);
+                      if (passcodeError) setPasscodeError(null);
+                    }}
+                    placeholder="Enter lock passcode..."
+                    autoFocus
+                    className="w-full bg-[#0d1220] border border-slate-800 rounded-xl px-3.5 py-2.5 pr-10 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-amber-500/60 transition-colors"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPasscodeText(!showPasscodeText)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 p-1"
+                    title={showPasscodeText ? "Hide passcode" : "Show passcode"}
+                  >
+                    {showPasscodeText ? (
+                      <EyeOff className="w-4 h-4" />
+                    ) : (
+                      <Eye className="w-4 h-4" />
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              {passcodeError && (
+                <div className="flex items-center gap-2 p-2.5 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-400">
+                  <AlertCircle className="w-4 h-4 shrink-0" />
+                  <span>{passcodeError}</span>
+                </div>
+              )}
+
+              <div className="flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  id="rememberUnlock"
+                  checked={rememberUnlock}
+                  onChange={(e) => setRememberUnlock(e.target.checked)}
+                  className="rounded border-slate-700 bg-slate-900 text-amber-500 focus:ring-0 cursor-pointer accent-amber-500"
+                />
+                <label
+                  htmlFor="rememberUnlock"
+                  className="cursor-pointer select-none text-slate-400"
+                >
+                  Remember unlock on this browser
+                </label>
+              </div>
+
+              <button
+                type="submit"
+                className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-sm font-semibold bg-amber-400 hover:bg-amber-300 text-slate-950 shadow-md shadow-amber-500/10 transition-all cursor-pointer font-medium"
+              >
+                <Unlock className="w-4 h-4" />
+                <span>Unlock Studio</span>
+              </button>
+            </form>
+          </div>
+        </div>
+
+        {/* Developer Credit 2: Subtle, always-visible footer centered at bottom */}
+        <footer className="relative z-10 py-4 text-center text-xs tracking-wider text-amber-500/70 border-t border-slate-800/80 bg-[#090d16]/90">
+          © Developed by SHANI MUGHAL
+        </footer>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-[#090d16] text-slate-200 flex flex-col justify-between selection:bg-amber-500/30 selection:text-amber-200">
       {/* Background ambient lighting */}
@@ -760,13 +907,25 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
       </div>
 
       <div className="relative z-10 max-w-4xl mx-auto w-full px-4 sm:px-6 py-6 sm:py-10 flex-1 flex flex-col">
-        {/* Main Header with Developer Credit 1 */}
-        <header className="text-center mb-6 sm:mb-8">
-          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-400 text-xs font-medium tracking-wider uppercase mb-2.5">
+        {/* Top utilities bar with Lock button */}
+        <div className="flex items-center justify-between gap-3 mb-4">
+          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-400 text-xs font-medium tracking-wider uppercase">
             <Sparkles className="w-3.5 h-3.5" />
             Gemini TTS Studio
           </div>
+          <button
+            type="button"
+            onClick={handleLockApp}
+            className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-slate-900/80 border border-slate-800 hover:border-amber-500/40 text-slate-400 hover:text-amber-400 text-xs font-medium transition-all cursor-pointer shadow-sm"
+            title="Lock Studio"
+          >
+            <Lock className="w-3.5 h-3.5 text-amber-400" />
+            <span>Lock Studio</span>
+          </button>
+        </div>
 
+        {/* Main Header with Developer Credit 1 */}
+        <header className="text-center mb-6 sm:mb-8">
           <h1 className="font-cinematic text-3xl sm:text-4xl md:text-5xl font-bold tracking-wide text-transparent bg-clip-text bg-gradient-to-r from-amber-200 via-amber-400 to-amber-100">
             SM Voice Studio
           </h1>
