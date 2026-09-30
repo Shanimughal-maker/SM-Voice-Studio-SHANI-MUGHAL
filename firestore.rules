@@ -24,8 +24,6 @@ service cloud.firestore {
     function isValidUserCreate(data, userId) {
       return isOwner(userId)
         && data.keys().hasAll(['email', 'plan', 'charactersUsed', 'freeLimit', 'createdAt'])
-        && data.keys().hasOnly(['email', 'plan', 'charactersUsed', 'planWordsUsed', 'freeLimit', 'planExpiresAt', 'createdAt'])
-        && data.email is string
         && data.plan == 'free'
         && data.charactersUsed == 0
         && (!('planWordsUsed' in data) || data.planWordsUsed == 0)
@@ -35,37 +33,40 @@ service cloud.firestore {
     }
 
     // 2. Users Collection
-    // Users can read only their own document (or admin).
-    // Users can create their own document only with plan "free" and zero usage.
-    // Users may read but NEVER update plan, planExpiresAt, planWordsUsed, charactersUsed or freeLimit.
     match /users/{userId} {
       allow get: if isOwner(userId) || isAdmin();
       allow list: if isAdmin();
-      allow create: if isValidUserCreate(request.resource.data, userId);
+      allow create: if isOwner(userId) && isValidUserCreate(request.resource.data, userId);
       allow update: if isAdmin()
         || (isOwner(userId)
-          && !request.resource.data.diff(resource.data).affectedKeys().hasAny([
-              'plan',
-              'planExpiresAt',
-              'planWordsUsed',
-              'charactersUsed',
-              'freeLimit'
-            ])
+          && (
+            // Regular usage increment (characters or words)
+            (request.resource.data.plan == resource.data.plan
+              && request.resource.data.planExpiresAt == resource.data.planExpiresAt
+              && request.resource.data.charactersUsed >= resource.data.charactersUsed)
+            // Or plan activation
+            || (request.resource.data.plan in ['free', 'threeday', 'monthly', 'quarterly', 'lifetime', 'pro_monthly', 'pro_3months'])
+          )
         );
       allow delete: if false;
     }
 
     // 3. Licenses Collection
-    // Licenses readable and writable ONLY by the admin
     match /licenses/{licenseId} {
-      allow read, write: if isAdmin();
+      allow read: if isSignedIn();
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin()
+        || (isSignedIn()
+          && resource.data.status == 'unused'
+          && request.resource.data.status == 'active'
+          && request.resource.data.redeemedBy == request.auth.uid
+          && request.resource.data.key == resource.data.key
+          && request.resource.data.plan == resource.data.plan);
     }
 
     // 4. Payment Requests Collection
-    // Created by owner (with status 'pending'), updated/deleted only by admin
     match /paymentRequests/{requestId} {
-      allow get: if (isSignedIn() && resource.data.uid == request.auth.uid) || isAdmin();
-      allow list: if (isSignedIn() && resource.data.uid == request.auth.uid) || isAdmin();
+      allow read: if (isSignedIn() && resource.data.uid == request.auth.uid) || isAdmin();
       allow create: if isSignedIn()
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.status == 'pending'

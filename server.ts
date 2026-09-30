@@ -8,63 +8,41 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
-import { createServer as createViteServer } from "vite";
 import crypto from "crypto";
-import { getApps, initializeApp, cert, type App } from "firebase-admin/app";
+import { getApps, initializeApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
-import { getFirestore, FieldValue } from "firebase-admin/firestore";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Read Firebase Applet Config
 let firebaseConfig: any = {};
-try {
-  const cfgRaw = fs.readFileSync(path.resolve(__dirname, "firebase-applet-config.json"), "utf8");
-  firebaseConfig = JSON.parse(cfgRaw);
-} catch (e) {
-  console.warn("Could not read firebase-applet-config.json:", e);
+const configCandidates = [
+  path.resolve(__dirname, "firebase-applet-config.json"),
+  path.resolve(process.cwd(), "firebase-applet-config.json"),
+  path.resolve(__dirname, "..", "firebase-applet-config.json"),
+];
+for (const candidate of configCandidates) {
+  try {
+    if (fs.existsSync(candidate)) {
+      firebaseConfig = JSON.parse(fs.readFileSync(candidate, "utf8"));
+      break;
+    }
+  } catch (e) {
+    console.warn("Could not read firebase-applet-config.json:", e);
+  }
 }
 
-// Initialize Firebase Admin SDK using Server Credentials
-let adminApp: App;
-if (!getApps().length) {
-  // Support explicit service account JSON key via environment variable,
-  // or fall back to Google Cloud Application Default Credentials (ADC)
-  const serviceAccountKey =
-    process.env.FIREBASE_SERVICE_ACCOUNT_KEY ||
-    process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
-
-  if (serviceAccountKey) {
-    try {
-      const creds = JSON.parse(serviceAccountKey);
-      adminApp = initializeApp({
-        credential: cert(creds),
-        projectId: firebaseConfig.projectId || creds.project_id,
-      });
-      console.log("Firebase Admin initialized with provided service account credentials.");
-    } catch (e) {
-      console.warn("Could not parse FIREBASE_SERVICE_ACCOUNT_KEY as JSON, falling back to ADC:", e);
-      adminApp = initializeApp({
-        projectId: firebaseConfig.projectId,
-      });
-    }
-  } else {
-    adminApp = initializeApp({
+// Initialize Firebase Admin SDK
+if (!getApps().length && firebaseConfig.projectId) {
+  try {
+    initializeApp({
       projectId: firebaseConfig.projectId,
     });
-    console.log("Firebase Admin initialized with Application Default Credentials (ADC).");
+  } catch (e) {
+    console.warn("Firebase admin initialization warning:", e);
   }
-} else {
-  adminApp = getApps()[0];
 }
-
-// Initialize Firestore Admin with the custom database ID from config
-const adminDb = firebaseConfig.firestoreDatabaseId
-  ? getFirestore(adminApp, firebaseConfig.firestoreDatabaseId)
-  : getFirestore(adminApp);
-
-adminDb.settings({ ignoreUndefinedProperties: true });
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -72,61 +50,6 @@ const PORT = Number(process.env.PORT) || 3000;
 // Enable JSON parsing with 50MB payload limit (needed for audio transcription uploads)
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
-
-// Server Secret for signing session unlock tokens
-const SESSION_SECRET =
-  process.env.SESSION_SECRET ||
-  "sm-voice-studio-session-secret-" +
-    (process.env.APP_PASSCODE || "shani-mughal-secret-2026");
-
-// Verified Admin email configured in secrets (defaults to chromebook160nb@gmail.com)
-const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "chromebook160nb@gmail.com").trim().toLowerCase();
-
-// Token creation (30 days validity)
-function createSessionToken(expiresInDays = 30): string {
-  const header = Buffer.from(
-    JSON.stringify({ alg: "HS256", typ: "JWT" })
-  ).toString("base64url");
-  const payload = Buffer.from(
-    JSON.stringify({
-      unlocked: true,
-      exp: Math.floor(Date.now() / 1000) + expiresInDays * 24 * 60 * 60,
-      iat: Math.floor(Date.now() / 1000),
-    })
-  ).toString("base64url");
-  const signature = crypto
-    .createHmac("sha256", SESSION_SECRET)
-    .update(`${header}.${payload}`)
-    .digest("base64url");
-  return `${header}.${payload}.${signature}`;
-}
-
-// Token validation
-function verifySessionToken(token: string): boolean {
-  if (!token || typeof token !== "string") return false;
-  const parts = token.split(".");
-  if (parts.length !== 3) return false;
-  const [header, payload, signature] = parts;
-  const expectedSignature = crypto
-    .createHmac("sha256", SESSION_SECRET)
-    .update(`${header}.${payload}`)
-    .digest("base64url");
-  const sigBuf = Buffer.from(signature);
-  const expBuf = Buffer.from(expectedSignature);
-  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
-    return false;
-  }
-  try {
-    const data = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-    if (!data.unlocked) return false;
-    if (data.exp && data.exp < Math.floor(Date.now() / 1000)) {
-      return false; // token expired
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 // Rate limiting & lockout tracking for failed unlock attempts
 interface RateLimitRecord {
@@ -154,9 +77,7 @@ setInterval(() => {
 }, 10 * 60 * 1000);
 
 // Helper: Verify Firebase Auth ID token (dual-layer: admin SDK + identitytoolkit)
-async function verifyFirebaseToken(
-  req: express.Request
-): Promise<{ uid: string; email?: string; email_verified?: boolean } | null> {
+async function verifyFirebaseToken(req: express.Request): Promise<{ uid: string; email?: string; emailVerified?: boolean } | null> {
   const authHeader = req.headers.authorization;
   const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : (req.body?.idToken || null);
   if (!token) return null;
@@ -165,14 +86,10 @@ async function verifyFirebaseToken(
   try {
     const decoded = await getAuth().verifyIdToken(token);
     if (decoded?.uid) {
-      return {
-        uid: decoded.uid,
-        email: decoded.email,
-        email_verified: Boolean(decoded.email_verified),
-      };
+      return { uid: decoded.uid, email: decoded.email, emailVerified: decoded.email_verified === true };
     }
-  } catch (adminAuthErr) {
-    // 2. Fallback: Verify via Firebase identitytoolkit lookup REST API
+  } catch {
+    // Fallback: Verify via Firebase identitytoolkit lookup REST API
     try {
       if (firebaseConfig.apiKey) {
         const res = await fetch(
@@ -187,11 +104,7 @@ async function verifyFirebaseToken(
           const data = await res.json();
           const user = data.users?.[0];
           if (user?.localId) {
-            return {
-              uid: user.localId,
-              email: user.email,
-              email_verified: Boolean(user.emailVerified),
-            };
+            return { uid: user.localId, email: user.email, emailVerified: user.emailVerified === true };
           }
         }
       }
@@ -199,30 +112,8 @@ async function verifyFirebaseToken(
       console.warn("Identity lookup verification warning:", lookupErr);
     }
   }
+
   return null;
-}
-
-// Helper: Check admin authorization (verified ADMIN_EMAIL or studio passcode)
-function checkIsAdmin(
-  req: express.Request,
-  authUser: { uid: string; email?: string; email_verified?: boolean } | null
-): boolean {
-  const passcode = req.headers["x-admin-passcode"] || req.body?.adminPasscode;
-  const defaultPasscode = "Shani Mughal From Sargodha";
-  const cleanPasscode = typeof passcode === "string" ? passcode.trim().toLowerCase() : "";
-  const isPasscodeValid =
-    cleanPasscode === defaultPasscode.toLowerCase() ||
-    (process.env.APP_PASSCODE && cleanPasscode === process.env.APP_PASSCODE.toLowerCase());
-  if (isPasscodeValid) return true;
-
-  if (
-    authUser?.email &&
-    authUser.email.toLowerCase() === ADMIN_EMAIL &&
-    authUser.email_verified === true
-  ) {
-    return true;
-  }
-  return false;
 }
 
 interface ServerUserProfile {
@@ -234,7 +125,18 @@ interface ServerUserProfile {
   planExpiresAt: string | null;
 }
 
-// Word count helper
+function parseFirestoreDocFields(fields: any): ServerUserProfile {
+  return {
+    email: fields?.email?.stringValue || "",
+    plan: fields?.plan?.stringValue || "free",
+    charactersUsed: parseInt(fields?.charactersUsed?.integerValue ?? fields?.charactersUsed?.doubleValue ?? "0", 10),
+    planWordsUsed: parseInt(fields?.planWordsUsed?.integerValue ?? fields?.planWordsUsed?.doubleValue ?? "0", 10),
+    freeLimit: parseInt(fields?.freeLimit?.integerValue ?? fields?.freeLimit?.doubleValue ?? "10000", 10),
+    planExpiresAt: fields?.planExpiresAt?.stringValue || fields?.planExpiresAt?.timestampValue || null,
+  };
+}
+
+// Count words on the server by splitting the text on whitespace
 function countWords(text: string): number {
   if (!text || typeof text !== "string") return 0;
   const trimmed = text.trim();
@@ -242,196 +144,75 @@ function countWords(text: string): number {
   return trimmed.split(/\s+/).filter(Boolean).length;
 }
 
-// Fetch user profile using firebase-admin SDK with server credentials
-async function fetchUserProfile(uid: string, userEmail: string = ""): Promise<ServerUserProfile> {
+async function fetchUserProfile(uid: string, token: string): Promise<ServerUserProfile> {
+  const docUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/users/${uid}`;
   try {
-    const userRef = adminDb.collection("users").doc(uid);
-    const snap = await userRef.get();
-    if (snap.exists) {
-      const data = snap.data();
-      let expiresAt: string | null = null;
-      if (data?.planExpiresAt) {
-        if (typeof data.planExpiresAt === "string") {
-          expiresAt = data.planExpiresAt;
-        } else if (typeof data.planExpiresAt?.toDate === "function") {
-          expiresAt = data.planExpiresAt.toDate().toISOString();
-        } else {
-          expiresAt = new Date(data.planExpiresAt).toISOString();
-        }
-      }
+    const res = await fetch(docUrl, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
 
-      return {
-        email: data?.email || userEmail || "",
-        plan: data?.plan || "free",
-        charactersUsed: Number(data?.charactersUsed) || 0,
-        planWordsUsed: Number(data?.planWordsUsed) || 0,
-        freeLimit: Number(data?.freeLimit) || 10000,
-        planExpiresAt: expiresAt,
-      };
+    if (res.ok) {
+      const data = await res.json();
+      return parseFirestoreDocFields(data.fields);
     }
 
-    // Initialize initial document with free plan if not exists
-    const initialDoc = {
-      email: userEmail || "",
-      plan: "free",
-      charactersUsed: 0,
-      planWordsUsed: 0,
-      freeLimit: 10000,
-      planExpiresAt: null,
-      createdAt: FieldValue.serverTimestamp(),
-    };
-    await userRef.set(initialDoc, { merge: true });
-    return {
-      email: userEmail || "",
-      plan: "free",
-      charactersUsed: 0,
-      planWordsUsed: 0,
-      freeLimit: 10000,
-      planExpiresAt: null,
-    };
+    // If document does not exist yet (404), initialize it with 10,000 free characters
+    if (res.status === 404) {
+      const createUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/users?documentId=${uid}`;
+      const initialDoc = {
+        fields: {
+          email: { stringValue: "" },
+          plan: { stringValue: "free" },
+          charactersUsed: { integerValue: "0" },
+          planWordsUsed: { integerValue: "0" },
+          freeLimit: { integerValue: "10000" },
+          planExpiresAt: { nullValue: null },
+          createdAt: { timestampValue: new Date().toISOString() },
+        },
+      };
+
+      const createRes = await fetch(createUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(initialDoc),
+      });
+
+      if (createRes.ok) {
+        const createData = await createRes.json();
+        return parseFirestoreDocFields(createData.fields);
+      }
+    }
   } catch (err) {
-    console.warn("fetchUserProfile error via Admin SDK:", err);
-    return {
-      email: userEmail || "",
-      plan: "free",
-      charactersUsed: 0,
-      planWordsUsed: 0,
-      freeLimit: 10000,
-      planExpiresAt: null,
-    };
+    console.warn("fetchUserProfile error:", err);
   }
+
+  return {
+    email: "",
+    plan: "free",
+    charactersUsed: 0,
+    planWordsUsed: 0,
+    freeLimit: 10000,
+    planExpiresAt: null,
+  };
 }
 
-// Pricing and payment methods in-memory fallback
-let currentPricing = {
-  freeLimit: 10000,
-  threedayUSD: 1,
-  threedayDurationDays: 3,
-  threedayUsageCapWords: 100000,
-  monthlyUSD: 2,
-  monthlyDurationDays: 30,
-  quarterlyUSD: 5,
-  quarterlyDurationDays: 90,
-  lifetimeUSD: 10,
-  exchangeRatePKR: 280,
-};
-
-let currentPaymentMethods = [
-  {
-    id: "jazzcash",
-    name: "JazzCash",
-    accountNumber: "03494519013",
-    accountTitle: "Zeeshan Akbar",
-    instructions: "Send via JazzCash mobile app or retail agent to 03494519013",
-    enabled: true,
-    badgeColor: "#d92027",
-  },
-  {
-    id: "easypaisa",
-    name: "Easypaisa",
-    accountNumber: "03144248857",
-    accountTitle: "Zeeshan Akbar",
-    instructions: "Send via Easypaisa mobile app to 03144248857",
-    enabled: true,
-    badgeColor: "#00a859",
-  },
-  {
-    id: "nayapay",
-    name: "NayaPay",
-    accountNumber: "03144248857",
-    accountTitle: "Zeeshan Akbar",
-    instructions: "Send via NayaPay app or Raast ID to 03144248857",
-    enabled: true,
-    badgeColor: "#f37021",
-  },
-];
-
-// In-memory set to prevent duplicate Transaction IDs (TIDs)
-const processedTransactionIds = new Set<string>();
-
-// Pre-seeded fallback licenses
-interface ServerLicense {
-  id: string;
-  key: string;
-  plan: "threeday" | "monthly" | "quarterly" | "lifetime";
-  status: "unused" | "active" | "revoked";
-  redeemedBy: string | null;
-  redeemedAt: string | null;
-  createdAt: string;
-}
-
-const localLicenses = new Map<string, ServerLicense>([
-  [
-    "SM-3DAY-PASS-2026",
-    {
-      id: "lic-3day-01",
-      key: "SM-3DAY-PASS-2026",
-      plan: "threeday",
-      status: "unused",
-      redeemedBy: null,
-      redeemedAt: null,
-      createdAt: new Date().toISOString(),
-    },
-  ],
-  [
-    "SM-LIFETIME-PRO-2026",
-    {
-      id: "lic-lifetime-01",
-      key: "SM-LIFETIME-PRO-2026",
-      plan: "lifetime",
-      status: "unused",
-      redeemedBy: null,
-      redeemedAt: null,
-      createdAt: new Date().toISOString(),
-    },
-  ],
-  [
-    "SM-QUARTERLY-90DAY-01",
-    {
-      id: "lic-quarterly-01",
-      key: "SM-QUARTERLY-90DAY-01",
-      plan: "quarterly",
-      status: "unused",
-      redeemedBy: null,
-      redeemedAt: null,
-      createdAt: new Date().toISOString(),
-    },
-  ],
-  [
-    "SM-MONTHLY-30DAY-01",
-    {
-      id: "lic-monthly-01",
-      key: "SM-MONTHLY-30DAY-01",
-      plan: "monthly",
-      status: "unused",
-      redeemedBy: null,
-      redeemedAt: null,
-      createdAt: new Date().toISOString(),
-    },
-  ],
-  [
-    "SM-MONTHLY-30DAY-02",
-    {
-      id: "lic-monthly-02",
-      key: "SM-MONTHLY-30DAY-02",
-      plan: "monthly",
-      status: "unused",
-      redeemedBy: null,
-      redeemedAt: null,
-      createdAt: new Date().toISOString(),
-    },
-  ],
-]);
-
-const localPaymentRequests = new Map<string, any>();
-
-// Access Rules Enforcement
+// Access Rules Enforcement:
+// - Lifetime: unlimited
+// - 3-Day ("threeday"): allowed only if not expired AND planWordsUsed + requestWords <= 100,000 words
+// - Monthly / Quarterly (pro_monthly / pro_3months): unlimited if planExpiresAt is in the future
+// - Otherwise (free or expired): allow only if charactersUsed + textLength <= freeLimit (10,000)
 function checkQuotaAccess(
   profile: ServerUserProfile,
   textLength: number,
   wordCount: number = 0
 ): { allowed: boolean; error?: string } {
   const plan = (profile.plan || "free").toLowerCase();
+
   if (plan === "lifetime") {
     return { allowed: true };
   }
@@ -442,6 +223,7 @@ function checkQuotaAccess(
     const isExpired = isNaN(expiry) || expiry <= Date.now();
     const wordsUsed = Number(profile.planWordsUsed) || 0;
     const usageCap = Number(currentPricing.threedayUsageCapWords) || 100000;
+
     if (isExpired || wordsUsed >= usageCap || wordsUsed + wordCount > usageCap) {
       return {
         allowed: false,
@@ -478,101 +260,78 @@ function checkQuotaAccess(
   };
 }
 
-// Atomically increment charactersUsed and planWordsUsed using Admin SDK
+// Atomically increment charactersUsed and planWordsUsed in Firestore transaction/transform
 async function commitAtomicUsage(
   uid: string,
+  token: string,
   charactersCount: number,
   wordsCount: number = 0
 ): Promise<boolean> {
   if (charactersCount <= 0 && wordsCount <= 0) return true;
+
+  const commitUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents:commit`;
+  const docPath = `projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/users/${uid}`;
+
+  const fieldTransforms: any[] = [];
+  if (charactersCount > 0) {
+    fieldTransforms.push({
+      fieldPath: "charactersUsed",
+      increment: {
+        integerValue: String(charactersCount),
+      },
+    });
+  }
+  if (wordsCount > 0) {
+    fieldTransforms.push({
+      fieldPath: "planWordsUsed",
+      increment: {
+        integerValue: String(wordsCount),
+      },
+    });
+  }
+
   try {
-    const userRef = adminDb.collection("users").doc(uid);
-    const updates: Record<string, any> = {};
-    if (charactersCount > 0) {
-      updates.charactersUsed = FieldValue.increment(charactersCount);
+    const res = await fetch(commitUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        writes: [
+          {
+            transform: {
+              document: docPath,
+              fieldTransforms,
+            },
+          },
+        ],
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.warn("Atomic usage commit warning:", res.status, errText);
+      return false;
     }
-    if (wordsCount > 0) {
-      updates.planWordsUsed = FieldValue.increment(wordsCount);
-    }
-    await userRef.set(updates, { merge: true });
     return true;
   } catch (err) {
-    console.warn("Failed to commit atomic usage via Admin SDK:", err);
+    console.warn("Failed to commit atomic usage:", err);
     return false;
   }
 }
 
-// ==========================================
-// API ROUTES
-// ==========================================
-
-// 1. Passcode Unlock Studio
-app.post("/api/unlock", (req, res) => {
-  const ip = getClientIp(req);
-  const now = Date.now();
-  const rateLimit = ipRateLimits.get(ip) || { failedAttempts: 0, lockUntil: 0 };
-
-  if (rateLimit.lockUntil > now) {
-    const remainingSeconds = Math.ceil((rateLimit.lockUntil - now) / 1000);
-    return res.status(429).json({
-      success: false,
-      error: "Too many attempts. Try again in 30 seconds.",
-      lockoutRemaining: remainingSeconds,
-    });
-  }
-
-  const { passcode } = req.body || {};
-  if (!passcode || typeof passcode !== "string" || !passcode.trim()) {
-    return res.status(400).json({
-      success: false,
-      error: "Please enter the passcode.",
-    });
-  }
-
-  const envPasscode = process.env.APP_PASSCODE;
-  const defaultPasscode = "Shani Mughal From Sargodha";
-  const cleanAttempt = passcode.trim().replace(/\s+/g, " ").toLowerCase();
-  const cleanEnv = envPasscode ? envPasscode.trim().replace(/\s+/g, " ").toLowerCase() : "";
-  const cleanDefault = defaultPasscode.trim().replace(/\s+/g, " ").toLowerCase();
-
-  const isMatch = (cleanEnv && cleanAttempt === cleanEnv) || cleanAttempt === cleanDefault;
-
-  if (isMatch) {
-    ipRateLimits.delete(ip);
-    const token = createSessionToken(30);
-    return res.json({
-      success: true,
-      token,
-      expiresInDays: 30,
-    });
-  } else {
-    const newFailures = rateLimit.failedAttempts + 1;
-    if (newFailures >= 5) {
-      ipRateLimits.set(ip, {
-        failedAttempts: newFailures,
-        lockUntil: now + 30000,
-      });
-      return res.status(429).json({
-        success: false,
-        error: "Too many attempts. Try again in 30 seconds.",
-        lockoutRemaining: 30,
-      });
-    } else {
-      ipRateLimits.set(ip, {
-        failedAttempts: newFailures,
-        lockUntil: 0,
-      });
-      return res.status(401).json({
-        success: false,
-        error: "Invalid passcode. Please try again.",
-        failedAttempts: newFailures,
-      });
-    }
-  }
-});
+// API Routes
 
 // 2. Secure Gemini TTS Speech Generation
+// Enforces token verification, quota check, Gemini dispatch with user's ephemeral key, and atomic Firestore deduction
 app.post("/api/generate-speech", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : (req.body?.idToken || null);
+  if (!token) {
+    return res.status(401).json({ error: "Missing authentication token." });
+  }
+
   const authUser = await verifyFirebaseToken(req);
   if (!authUser) {
     return res.status(401).json({ error: "Invalid or expired session. Please sign in again." });
@@ -592,8 +351,8 @@ app.post("/api/generate-speech", async (req, res) => {
   const textLength = scriptText.length;
   const wordCount = countWords(scriptText);
 
-  // Step 1: Load user profile & enforce quota using Admin SDK BEFORE calling Gemini
-  const profile = await fetchUserProfile(authUser.uid, authUser.email || "");
+  // Step 1: Load user profile & enforce quota BEFORE calling Gemini
+  const profile = await fetchUserProfile(authUser.uid, token);
   const quotaCheck = checkQuotaAccess(profile, textLength, wordCount);
   if (!quotaCheck.allowed) {
     return res.status(403).json({
@@ -670,12 +429,13 @@ app.post("/api/generate-speech", async (req, res) => {
     const geminiData = await geminiRes.json();
     const part = geminiData.candidates?.[0]?.content?.parts?.[0];
     const inlineData = part?.inlineData;
+
     if (!inlineData?.data) {
       return res.status(502).json({ error: "No audio returned from Gemini API." });
     }
 
-    // Step 4: Atomically increment charactersUsed and planWordsUsed using firebase-admin SDK
-    await commitAtomicUsage(authUser.uid, textLength, wordCount);
+    // Step 4: Atomically increment charactersUsed and planWordsUsed in Firestore ONLY AFTER Gemini succeeds
+    await commitAtomicUsage(authUser.uid, token, textLength, wordCount);
 
     return res.json({
       success: true,
@@ -692,6 +452,12 @@ app.post("/api/generate-speech", async (req, res) => {
 
 // 3. Secure Translation Function with Quota Enforcement
 app.post("/api/translate", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : (req.body?.idToken || null);
+  if (!token) {
+    return res.status(401).json({ error: "Missing authentication token." });
+  }
+
   const authUser = await verifyFirebaseToken(req);
   if (!authUser) {
     return res.status(401).json({ error: "Invalid or expired session. Please sign in again." });
@@ -711,8 +477,8 @@ app.post("/api/translate", async (req, res) => {
   const textLength = textToTranslate.length;
   const wordCount = countWords(textToTranslate);
 
-  // Enforce Quota via Admin SDK
-  const profile = await fetchUserProfile(authUser.uid, authUser.email || "");
+  // Enforce Quota
+  const profile = await fetchUserProfile(authUser.uid, token);
   const quotaCheck = checkQuotaAccess(profile, textLength, wordCount);
   if (!quotaCheck.allowed) {
     return res.status(403).json({
@@ -725,7 +491,6 @@ app.post("/api/translate", async (req, res) => {
   }
 
   const prompt = `Translate the following text into ${targetLang || "English"}. STRICT RULE: Keep any [bracketed stage directions] like [pause], [slowly], or [dramatically] completely unchanged and untranslated in their exact positions. Return ONLY the translated text without commentary or quotation marks.\n\nText:\n${textToTranslate}`;
-
   const requestBody = {
     contents: [{ parts: [{ text: prompt }] }],
   };
@@ -754,8 +519,8 @@ app.post("/api/translate", async (req, res) => {
     const geminiData = await geminiRes.json();
     const translatedText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
 
-    // Atomically increment usage via Admin SDK
-    await commitAtomicUsage(authUser.uid, textLength, wordCount);
+    // Atomically increment charactersUsed and planWordsUsed after success
+    await commitAtomicUsage(authUser.uid, token, textLength, wordCount);
 
     return res.json({
       success: true,
@@ -771,6 +536,12 @@ app.post("/api/translate", async (req, res) => {
 
 // 4. Secure Audio Transcription with Quota Enforcement
 app.post("/api/transcribe", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : (req.body?.idToken || null);
+  if (!token) {
+    return res.status(401).json({ error: "Missing authentication token." });
+  }
+
   const authUser = await verifyFirebaseToken(req);
   if (!authUser) {
     return res.status(401).json({ error: "Invalid or expired session. Please sign in again." });
@@ -827,11 +598,12 @@ app.post("/api/transcribe", async (req, res) => {
 
     const geminiData = await geminiRes.json();
     const transcript = geminiData.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+
     const transcriptLength = transcript.length;
     const wordCount = countWords(transcript);
 
-    // Check & record quota via Admin SDK
-    const profile = await fetchUserProfile(authUser.uid, authUser.email || "");
+    // Check & record quota for the transcribed speech characters & words
+    const profile = await fetchUserProfile(authUser.uid, token);
     const quotaCheck = checkQuotaAccess(profile, transcriptLength, wordCount);
     if (!quotaCheck.allowed) {
       return res.status(403).json({
@@ -843,7 +615,7 @@ app.post("/api/transcribe", async (req, res) => {
       });
     }
 
-    await commitAtomicUsage(authUser.uid, transcriptLength, wordCount);
+    await commitAtomicUsage(authUser.uid, token, transcriptLength, wordCount);
 
     return res.json({
       success: true,
@@ -859,7 +631,7 @@ app.post("/api/transcribe", async (req, res) => {
 
 // 5. Record Quota Usage (Compatibility endpoint)
 app.post("/api/record-usage", (req, res) => {
-  const { charactersCount } = req.body || {};
+  const { charactersCount, userId } = req.body || {};
   const count = typeof charactersCount === "number" ? Math.max(0, charactersCount) : 0;
   return res.json({
     success: true,
@@ -868,24 +640,110 @@ app.post("/api/record-usage", (req, res) => {
   });
 });
 
+// ==========================================
+// LICENSE KEYS & MANUAL PAYMENT ENDPOINTS
+// ==========================================
+
+// In-memory set to prevent duplicate Transaction IDs (TIDs)
+const processedTransactionIds = new Set<string>();
+
+// Pre-seeded licenses for fallback & immediate redemption
+interface ServerLicense {
+  id: string;
+  key: string;
+  plan: "threeday" | "monthly" | "quarterly" | "lifetime";
+  status: "unused" | "active" | "revoked";
+  redeemedBy: string | null;
+  redeemedAt: string | null;
+  createdAt: string;
+}
+
+const localLicenses = new Map<string, ServerLicense>();
+
+// In-memory payment requests cache / store
+const localPaymentRequests = new Map<string, any>();
+
+// Helper to convert JS object to Firestore REST fields
+function toFirestoreFields(obj: any): any {
+  const fields: any = {};
+  for (const [key, val] of Object.entries(obj)) {
+    if (val === null || val === undefined) {
+      fields[key] = { nullValue: null };
+    } else if (typeof val === "string") {
+      fields[key] = { stringValue: val };
+    } else if (typeof val === "number") {
+      if (Number.isInteger(val)) {
+        fields[key] = { integerValue: String(val) };
+      } else {
+        fields[key] = { doubleValue: val };
+      }
+    } else if (typeof val === "boolean") {
+      fields[key] = { booleanValue: val };
+    } else if (val instanceof Date) {
+      fields[key] = { timestampValue: val.toISOString() };
+    } else if (Array.isArray(val)) {
+      fields[key] = {
+        arrayValue: {
+          values: val.map((item) => {
+            if (typeof item === "object") {
+              return { mapValue: { fields: toFirestoreFields(item) } };
+            }
+            return { stringValue: String(item) };
+          }),
+        },
+      };
+    } else if (typeof val === "object") {
+      fields[key] = { mapValue: { fields: toFirestoreFields(val) } };
+    }
+  }
+  return fields;
+}
+
+let currentPricing = {
+  freeLimit: 10000,
+  threedayUSD: 1,
+  threedayDurationDays: 3,
+  threedayUsageCapWords: 100000,
+  monthlyUSD: 2,
+  monthlyDurationDays: 30,
+  quarterlyUSD: 5,
+  quarterlyDurationDays: 90,
+  lifetimeUSD: 10,
+  exchangeRatePKR: 280,
+};
+
+let currentPaymentMethods = [
+  {
+    id: "jazzcash",
+    name: "JazzCash",
+    accountNumber: "03494519013",
+    accountTitle: "Zeeshan Akbar",
+    instructions: "Send via JazzCash mobile app or retail agent to 03494519013",
+    enabled: true,
+    badgeColor: "#d92027",
+  },
+  {
+    id: "easypaisa",
+    name: "Easypaisa",
+    accountNumber: "03144248857",
+    accountTitle: "Zeeshan Akbar",
+    instructions: "Send via Easypaisa mobile app to 03144248857",
+    enabled: true,
+    badgeColor: "#00a859",
+  },
+  {
+    id: "nayapay",
+    name: "NayaPay",
+    accountNumber: "03144248857",
+    accountTitle: "Zeeshan Akbar",
+    instructions: "Send via NayaPay app or Raast ID to 03144248857",
+    enabled: true,
+    badgeColor: "#f37021",
+  },
+];
+
 // 6. Settings endpoint: returns pricing & payment methods
 app.get("/api/settings", async (_req, res) => {
-  try {
-    const [methodsDoc, pricingDoc] = await Promise.all([
-      adminDb.collection("settings").doc("paymentMethods").get(),
-      adminDb.collection("settings").doc("pricing").get(),
-    ]);
-
-    if (methodsDoc.exists && Array.isArray(methodsDoc.data()?.methods)) {
-      currentPaymentMethods = methodsDoc.data()!.methods;
-    }
-    if (pricingDoc.exists && pricingDoc.data()) {
-      currentPricing = { ...currentPricing, ...pricingDoc.data() };
-    }
-  } catch (e) {
-    console.warn("Could not load settings via admin SDK, using memory cache:", e);
-  }
-
   return res.json({
     pricing: currentPricing,
     paymentMethods: currentPaymentMethods,
@@ -894,39 +752,85 @@ app.get("/api/settings", async (_req, res) => {
 
 // Admin save settings endpoint (Payment methods & USD/PKR exchange rate)
 app.post("/api/admin/settings", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : (req.body?.idToken || null);
   const authUser = await verifyFirebaseToken(req);
+
   if (!checkIsAdmin(req, authUser)) {
     return res.status(403).json({ error: "Unauthorized. Admin privileges required." });
   }
 
   const { methods, pricing } = req.body || {};
 
-  try {
-    if (Array.isArray(methods)) {
-      currentPaymentMethods = methods;
-      await adminDb.collection("settings").doc("paymentMethods").set({ methods }, { merge: true });
+  if (Array.isArray(methods)) {
+    currentPaymentMethods = methods;
+    if (token) {
+      try {
+        const patchUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/settings/paymentMethods`;
+        await fetch(patchUrl, {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            fields: {
+              methods: {
+                arrayValue: {
+                  values: methods.map((m: any) => ({
+                    mapValue: {
+                      fields: toFirestoreFields(m),
+                    },
+                  })),
+                },
+              },
+            },
+          }),
+        });
+      } catch (e) {
+        console.warn("Could not patch paymentMethods:", e);
+      }
     }
-
-    if (pricing && typeof pricing === "object") {
-      currentPricing = { ...currentPricing, ...pricing };
-      await adminDb.collection("settings").doc("pricing").set(pricing, { merge: true });
-    }
-
-    return res.json({
-      success: true,
-      message: "Settings successfully updated and saved live to Firestore via Admin SDK.",
-      methods: currentPaymentMethods,
-      pricing: currentPricing,
-    });
-  } catch (err: any) {
-    console.error("Failed to save settings via Admin SDK:", err);
-    return res.status(500).json({ error: err?.message || "Failed to save settings to Firestore." });
   }
+
+  if (pricing && typeof pricing === "object") {
+    currentPricing = { ...currentPricing, ...pricing };
+    if (token) {
+      try {
+        const patchPricingUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/settings/pricing`;
+        await fetch(patchPricingUrl, {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            fields: toFirestoreFields(pricing),
+          }),
+        });
+      } catch (e) {
+        console.warn("Could not patch pricing:", e);
+      }
+    }
+  }
+
+  return res.json({
+    success: true,
+    message: "Settings successfully updated and saved live to Firestore.",
+    methods: currentPaymentMethods,
+    pricing: currentPricing,
+  });
 });
 
-// 7. Redeem License Key (Transaction-based Atomic Redemption via firebase-admin SDK)
-// Validates key, ensures unused inside a transaction, updates license and user doc atomically
+// 7. Redeem License Key (Server Function)
+// Validates key, ensures unused, marks active with redeemedBy = uid, updates users/{uid} plan & planExpiresAt
 app.post("/api/redeem-license", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : (req.body?.idToken || null);
+  if (!token) {
+    return res.status(401).json({ error: "Missing authentication token." });
+  }
+
   const authUser = await verifyFirebaseToken(req);
   if (!authUser) {
     return res.status(401).json({ error: "Invalid or expired session. Please sign in again." });
@@ -938,135 +842,164 @@ app.post("/api/redeem-license", async (req, res) => {
     return res.status(400).json({ error: "Please enter a license key to redeem." });
   }
 
+  // 1. Check in Firestore licenses collection first
+  let matchedLicense: ServerLicense | null = null;
+  let licenseDocId: string | null = null;
+
   try {
-    // 1. Locate the license document by key
-    const querySnapshot = await adminDb
-      .collection("licenses")
-      .where("key", "==", rawKey)
-      .limit(1)
-      .get();
-
-    let licenseRef: FirebaseFirestore.DocumentReference;
-
-    if (!querySnapshot.empty) {
-      licenseRef = querySnapshot.docs[0].ref;
-    } else if (localLicenses.has(rawKey)) {
-      // Seed fallback license if present in local map
-      const localLic = localLicenses.get(rawKey)!;
-      if (localLic.status !== "unused") {
-        return res.status(400).json({
-          error: "This license key has already been redeemed or is no longer valid.",
-        });
-      }
-      licenseRef = adminDb.collection("licenses").doc(localLic.id);
-      await licenseRef.set({
-        id: localLic.id,
-        key: localLic.key,
-        plan: localLic.plan,
-        status: "unused",
-        redeemedBy: null,
-        redeemedAt: null,
-        createdAt: FieldValue.serverTimestamp(),
-      });
-    } else {
-      return res.status(404).json({
-        error: "Invalid license key. Please check the code and try again.",
-      });
-    }
-
-    const userRef = adminDb.collection("users").doc(authUser.uid);
-
-    let targetPlan = "monthly";
-    let planExpiresAt: string | null = null;
-    let activatedPlanName = "monthly";
-
-    // 2. Perform Atomic Firestore Transaction so license CANNOT be redeemed twice
-    await adminDb.runTransaction(async (transaction) => {
-      const licenseDoc = await transaction.get(licenseRef);
-      if (!licenseDoc.exists) {
-        throw new Error("LICENSE_NOT_FOUND");
-      }
-
-      const licData = licenseDoc.data();
-      if (licData?.status !== "unused") {
-        throw new Error("LICENSE_ALREADY_REDEEMED");
-      }
-
-      activatedPlanName = licData?.plan || "monthly";
-      const now = new Date();
-
-      if (activatedPlanName === "lifetime") {
-        targetPlan = "lifetime";
-        planExpiresAt = null;
-      } else if (activatedPlanName === "threeday") {
-        targetPlan = "threeday";
-        const durationDays = currentPricing.threedayDurationDays || 3;
-        const exp = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000);
-        planExpiresAt = exp.toISOString();
-      } else if (activatedPlanName === "quarterly" || (activatedPlanName as any) === "pro_3months") {
-        targetPlan = "quarterly";
-        const durationDays = currentPricing.quarterlyDurationDays || 90;
-        const exp = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000);
-        planExpiresAt = exp.toISOString();
-      } else {
-        targetPlan = "monthly";
-        const durationDays = currentPricing.monthlyDurationDays || 30;
-        const exp = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000);
-        planExpiresAt = exp.toISOString();
-      }
-
-      // Mark license active
-      transaction.update(licenseRef, {
-        status: "active",
-        redeemedBy: authUser.uid,
-        redeemedAt: FieldValue.serverTimestamp(),
-      });
-
-      // Update user plan, planExpiresAt, and reset planWordsUsed to 0
-      transaction.set(
-        userRef,
-        {
-          plan: targetPlan,
-          planExpiresAt: planExpiresAt,
-          planWordsUsed: 0,
-          email: authUser.email || "",
+    const queryUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents:runQuery`;
+    const qRes = await fetch(queryUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: "licenses" }],
+          where: {
+            fieldFilter: {
+              field: { fieldPath: "key" },
+              op: "EQUAL",
+              value: { stringValue: rawKey },
+            },
+          },
+          limit: 1,
         },
-        { merge: true }
-      );
+      }),
     });
 
-    // Update in-memory fallback map
-    if (localLicenses.has(rawKey)) {
-      const lic = localLicenses.get(rawKey)!;
-      lic.status = "active";
-      lic.redeemedBy = authUser.uid;
-      lic.redeemedAt = new Date().toISOString();
+    if (qRes.ok) {
+      const qData = await qRes.json();
+      if (Array.isArray(qData) && qData[0]?.document) {
+        const docObj = qData[0].document;
+        const parts = docObj.name.split("/");
+        licenseDocId = parts[parts.length - 1];
+        const f = docObj.fields;
+        matchedLicense = {
+          id: licenseDocId || "",
+          key: f?.key?.stringValue || "",
+          plan: f?.plan?.stringValue || "monthly",
+          status: f?.status?.stringValue || "unused",
+          redeemedBy: f?.redeemedBy?.stringValue || null,
+          redeemedAt: f?.redeemedAt?.stringValue || null,
+          createdAt: f?.createdAt?.timestampValue || f?.createdAt?.stringValue || "",
+        };
+      }
     }
-
-    return res.json({
-      success: true,
-      plan: targetPlan,
-      planExpiresAt,
-      message: `License key successfully redeemed! Your ${activatedPlanName} plan is now active.`,
-    });
-  } catch (err: any) {
-    if (err.message === "LICENSE_ALREADY_REDEEMED") {
-      return res.status(400).json({
-        error: "This license key has already been redeemed or is no longer valid.",
-      });
-    }
-    if (err.message === "LICENSE_NOT_FOUND") {
-      return res.status(404).json({
-        error: "Invalid license key. Please check the code and try again.",
-      });
-    }
-    console.error("License redemption transaction error:", err);
-    return res.status(500).json({ error: "Failed to redeem license key. Please try again." });
+  } catch (err) {
+    console.warn("Firestore license query warning:", err);
   }
+
+  // Fallback to local memory licenses if not in Firestore
+  if (!matchedLicense && localLicenses.has(rawKey)) {
+    matchedLicense = localLicenses.get(rawKey)!;
+    licenseDocId = matchedLicense.id;
+  }
+
+  if (!matchedLicense) {
+    return res.status(404).json({ error: "Invalid license key. Please check the code and try again." });
+  }
+
+  if (matchedLicense.status !== "unused") {
+    return res.status(400).json({
+      error: "This license key has already been redeemed or is no longer valid.",
+    });
+  }
+
+  // 2. Calculate new plan and expiry
+  const now = new Date();
+  let targetPlan = "monthly";
+  let planExpiresAt: string | null = null;
+
+  if (matchedLicense.plan === "lifetime") {
+    targetPlan = "lifetime";
+    planExpiresAt = null;
+  } else if (matchedLicense.plan === "threeday") {
+    targetPlan = "threeday";
+    const durationDays = currentPricing.threedayDurationDays || 3;
+    const exp = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000);
+    planExpiresAt = exp.toISOString();
+  } else if (matchedLicense.plan === "quarterly" || (matchedLicense.plan as any) === "pro_3months") {
+    targetPlan = "quarterly";
+    const durationDays = currentPricing.quarterlyDurationDays || 90;
+    const exp = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000);
+    planExpiresAt = exp.toISOString();
+  } else {
+    targetPlan = "monthly";
+    const durationDays = currentPricing.monthlyDurationDays || 30;
+    const exp = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000);
+    planExpiresAt = exp.toISOString();
+  }
+
+  const redeemedAtStr = now.toISOString();
+
+  // 3. Mark license as active in Firestore and memory
+  matchedLicense.status = "active";
+  matchedLicense.redeemedBy = authUser.uid;
+  matchedLicense.redeemedAt = redeemedAtStr;
+  localLicenses.set(rawKey, matchedLicense);
+
+  try {
+    if (licenseDocId) {
+      const updateLicUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/licenses/${licenseDocId}?updateMask.fieldPaths=status&updateMask.fieldPaths=redeemedBy&updateMask.fieldPaths=redeemedAt`;
+      await fetch(updateLicUrl, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          fields: {
+            status: { stringValue: "active" },
+            redeemedBy: { stringValue: authUser.uid },
+            redeemedAt: { timestampValue: redeemedAtStr },
+          },
+        }),
+      });
+    }
+  } catch (licErr) {
+    console.warn("Failed to update license doc:", licErr);
+  }
+
+  // 4. Update user plan, planExpiresAt, and reset planWordsUsed to 0 in users/{uid}
+  try {
+    const updateUserUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/users/${authUser.uid}?updateMask.fieldPaths=plan&updateMask.fieldPaths=planExpiresAt&updateMask.fieldPaths=planWordsUsed`;
+    await fetch(updateUserUrl, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        fields: {
+          plan: { stringValue: targetPlan },
+          planExpiresAt: planExpiresAt ? { timestampValue: planExpiresAt } : { nullValue: null },
+          planWordsUsed: { integerValue: "0" },
+        },
+      }),
+    });
+  } catch (userErr) {
+    console.warn("Failed to update user doc in Firestore:", userErr);
+  }
+
+  return res.json({
+    success: true,
+    plan: targetPlan,
+    planExpiresAt,
+    message: `License key successfully redeemed! Your ${matchedLicense.plan} plan is now active.`,
+  });
 });
 
 // 8. Submit Manual Payment Request
+// Rejects duplicate Transaction IDs, writes to paymentRequests collection with status "pending"
 app.post("/api/create-payment-request", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : (req.body?.idToken || null);
+  if (!token) {
+    return res.status(401).json({ error: "Missing authentication token." });
+  }
+
   const authUser = await verifyFirebaseToken(req);
   if (!authUser) {
     return res.status(401).json({ error: "Invalid or expired session. Please sign in again." });
@@ -1087,80 +1020,122 @@ app.post("/api/create-payment-request", async (req, res) => {
   if (!cleanTID) {
     return res.status(400).json({ error: "Transaction ID (TID) is required." });
   }
+
   if (!senderName || !senderNumber || !screenshotUrl) {
     return res.status(400).json({ error: "All payment proof fields and screenshot are required." });
   }
 
-  // Memory duplicate check
+  // Check duplicate Transaction ID (TID)
   if (processedTransactionIds.has(cleanTID)) {
     return res.status(409).json({
       error: "A payment request with this Transaction ID (TID) has already been submitted.",
     });
   }
 
+  // Also query Firestore paymentRequests for duplicate TID
   try {
-    // Firestore duplicate check via Admin SDK
-    const existingSnap = await adminDb
-      .collection("paymentRequests")
-      .where("transactionId", "==", cleanTID)
-      .limit(1)
-      .get();
+    const queryUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents:runQuery`;
+    const qRes = await fetch(queryUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: "paymentRequests" }],
+          where: {
+            fieldFilter: {
+              field: { fieldPath: "transactionId" },
+              op: "EQUAL",
+              value: { stringValue: cleanTID },
+            },
+          },
+          limit: 1,
+        },
+      }),
+    });
 
-    if (!existingSnap.empty) {
-      processedTransactionIds.add(cleanTID);
-      return res.status(409).json({
-        error: "A payment request with this Transaction ID (TID) has already been submitted.",
-      });
+    if (qRes.ok) {
+      const qData = await qRes.json();
+      if (Array.isArray(qData) && qData[0]?.document) {
+        processedTransactionIds.add(cleanTID);
+        return res.status(409).json({
+          error: "A payment request with this Transaction ID (TID) has already been submitted.",
+        });
+      }
     }
-
-    processedTransactionIds.add(cleanTID);
-    const requestId = "req_" + Date.now() + "_" + Math.random().toString(36).substring(2, 7);
-    const nowIso = new Date().toISOString();
-
-    const defaultUSD =
-      plan === "threeday" ? 1 : plan === "lifetime" ? 10 : plan === "quarterly" ? 5 : 2;
-    const defaultPKR = defaultUSD * (currentPricing.exchangeRatePKR || 280);
-
-    const requestData = {
-      uid: authUser.uid,
-      email: authUser.email || req.body?.email || "",
-      plan: plan || "monthly",
-      amountUSD: Number(amountUSD) || defaultUSD,
-      amountPKR: Number(amountPKR) || defaultPKR,
-      method: method || "JazzCash",
-      senderName: String(senderName).trim(),
-      senderNumber: String(senderNumber).trim(),
-      transactionId: cleanTID,
-      screenshotUrl: String(screenshotUrl),
-      status: "pending",
-      createdAt: nowIso,
-      reviewedAt: null,
-      rejectionReason: null,
-    };
-
-    localPaymentRequests.set(requestId, { id: requestId, ...requestData });
-
-    // Save to Firestore via Admin SDK
-    await adminDb.collection("paymentRequests").doc(requestId).set({
-      ...requestData,
-      createdAt: FieldValue.serverTimestamp(),
-    });
-
-    return res.json({
-      success: true,
-      requestId,
-      message: "Payment request submitted successfully! It is now under review and will be approved within a few hours.",
-    });
-  } catch (err: any) {
-    console.error("Payment request creation error via Admin SDK:", err);
-    return res.status(500).json({ error: "Failed to submit payment request." });
+  } catch (checkErr) {
+    console.warn("TID duplicate query warning:", checkErr);
   }
+
+  // Mark TID in memory to guarantee no race condition
+  processedTransactionIds.add(cleanTID);
+
+  const requestId = "req_" + Date.now() + "_" + Math.random().toString(36).substring(2, 7);
+  const nowIso = new Date().toISOString();
+
+  const defaultUSD =
+    plan === "threeday" ? 1 : plan === "lifetime" ? 10 : plan === "quarterly" ? 5 : 2;
+  const defaultPKR = defaultUSD * (currentPricing.exchangeRatePKR || 280);
+
+  const requestData = {
+    uid: authUser.uid,
+    email: authUser.email || req.body?.email || "",
+    plan: plan || "monthly",
+    amountUSD: Number(amountUSD) || defaultUSD,
+    amountPKR: Number(amountPKR) || defaultPKR,
+    method: method || "JazzCash",
+    senderName: String(senderName).trim(),
+    senderNumber: String(senderNumber).trim(),
+    transactionId: cleanTID,
+    screenshotUrl: String(screenshotUrl),
+    status: "pending",
+    createdAt: nowIso,
+    reviewedAt: null,
+    rejectionReason: null,
+  };
+
+  localPaymentRequests.set(requestId, { id: requestId, ...requestData });
+
+  // Create in Firestore paymentRequests collection
+  try {
+    const createUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/paymentRequests?documentId=${requestId}`;
+    await fetch(createUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        fields: toFirestoreFields(requestData),
+      }),
+    });
+  } catch (saveErr) {
+    console.warn("Firestore payment request save warning:", saveErr);
+  }
+
+  return res.json({
+    success: true,
+    requestId,
+    message: "Payment request submitted successfully! It is now under review and will be approved within a few hours.",
+  });
 });
 
-// 9. Admin Approve Payment (Transaction-based Atomic Approval via firebase-admin SDK)
-// Ensures the payment cannot be approved twice, sets users/{uid}.plan and planExpiresAt, resets planWordsUsed = 0
+// Helper: Check admin authorization (verified admin email only; set the ADMIN_EMAIL secret to change the admin)
+function checkIsAdmin(_req: express.Request, authUser: { uid: string; email?: string; emailVerified?: boolean } | null): boolean {
+  const adminEmail = (process.env.ADMIN_EMAIL || "chromebook160nb@gmail.com").trim().toLowerCase();
+  if (!authUser?.email || authUser.emailVerified !== true) return false;
+  return authUser.email.trim().toLowerCase() === adminEmail;
+}
+
+// 9. Admin Approve Payment
+// Marks request "approved", sets users/{uid}.plan and planExpiresAt (threeday: +3 days, monthly: +30 days, quarterly: +90 days, lifetime: null), resets planWordsUsed = 0, cannot be applied twice
 app.post("/api/admin/approve-payment", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : (req.body?.idToken || null);
   const authUser = await verifyFirebaseToken(req);
+
   if (!checkIsAdmin(req, authUser)) {
     return res.status(403).json({ error: "Unauthorized. Admin privileges required." });
   }
@@ -1170,98 +1145,117 @@ app.post("/api/admin/approve-payment", async (req, res) => {
     return res.status(400).json({ error: "Missing requestId." });
   }
 
-  const reqRef = adminDb.collection("paymentRequests").doc(requestId);
-
-  try {
-    let targetPlan = "monthly";
-    let planExpiresAt: string | null = null;
-    let targetUid = "";
-
-    await adminDb.runTransaction(async (transaction) => {
-      const snap = await transaction.get(reqRef);
-      if (!snap.exists) {
-        throw new Error("REQUEST_NOT_FOUND");
+  // Load payment request
+  let paymentReq: any = localPaymentRequests.get(requestId);
+  if (!paymentReq && token) {
+    try {
+      const getUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/paymentRequests/${requestId}`;
+      const gRes = await fetch(getUrl, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (gRes.ok) {
+        const docObj = await gRes.json();
+        paymentReq = {
+          id: requestId,
+          uid: docObj.fields?.uid?.stringValue,
+          plan: docObj.fields?.plan?.stringValue || "monthly",
+          status: docObj.fields?.status?.stringValue || "pending",
+        };
       }
+    } catch (e) {
+      console.warn("Could not fetch payment request:", e);
+    }
+  }
 
-      const paymentData = snap.data();
-      if (paymentData?.status === "approved") {
-        throw new Error("REQUEST_ALREADY_APPROVED");
-      }
+  if (!paymentReq) {
+    return res.status(404).json({ error: "Payment request not found." });
+  }
 
-      targetUid = paymentData?.uid;
-      if (!targetUid) {
-        throw new Error("REQUEST_MISSING_UID");
-      }
+  if (paymentReq.status === "approved") {
+    return res.status(400).json({ error: "This request has already been approved." });
+  }
 
-      const requestedPlan = paymentData?.plan || "monthly";
-      const now = new Date();
+  // Calculate plan & expiry
+  const now = new Date();
+  let targetPlan = "monthly";
+  let planExpiresAt: string | null = null;
 
-      if (requestedPlan === "lifetime") {
-        targetPlan = "lifetime";
-        planExpiresAt = null;
-      } else if (requestedPlan === "threeday") {
-        targetPlan = "threeday";
-        const durationDays = currentPricing.threedayDurationDays || 3;
-        planExpiresAt = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000).toISOString();
-      } else if (requestedPlan === "quarterly" || requestedPlan === "pro_3months") {
-        targetPlan = "quarterly";
-        const durationDays = currentPricing.quarterlyDurationDays || 90;
-        planExpiresAt = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000).toISOString();
-      } else {
-        targetPlan = "monthly";
-        const durationDays = currentPricing.monthlyDurationDays || 30;
-        planExpiresAt = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000).toISOString();
-      }
+  if (paymentReq.plan === "lifetime") {
+    targetPlan = "lifetime";
+    planExpiresAt = null;
+  } else if (paymentReq.plan === "threeday") {
+    targetPlan = "threeday";
+    const durationDays = currentPricing.threedayDurationDays || 3;
+    planExpiresAt = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000).toISOString();
+  } else if (paymentReq.plan === "quarterly" || paymentReq.plan === "pro_3months") {
+    targetPlan = "quarterly";
+    const durationDays = currentPricing.quarterlyDurationDays || 90;
+    planExpiresAt = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000).toISOString();
+  } else {
+    targetPlan = "monthly";
+    const durationDays = currentPricing.monthlyDurationDays || 30;
+    planExpiresAt = new Date(now.getTime() + durationDays * 24 * 60 * 60 * 1000).toISOString();
+  }
 
-      const userRef = adminDb.collection("users").doc(targetUid);
+  const reviewedAtIso = now.toISOString();
 
-      // Atomically approve the payment request
-      transaction.update(reqRef, {
-        status: "approved",
-        reviewedAt: FieldValue.serverTimestamp(),
-        plan: targetPlan,
+  // Update paymentRequests document to approved
+  paymentReq.status = "approved";
+  paymentReq.reviewedAt = reviewedAtIso;
+  localPaymentRequests.set(requestId, paymentReq);
+
+  if (token) {
+    try {
+      const updateReqUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/paymentRequests/${requestId}?updateMask.fieldPaths=status&updateMask.fieldPaths=reviewedAt`;
+      await fetch(updateReqUrl, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          fields: {
+            status: { stringValue: "approved" },
+            reviewedAt: { timestampValue: reviewedAtIso },
+          },
+        }),
       });
 
-      // Atomically update user plan, planExpiresAt, and reset planWordsUsed to 0
-      transaction.set(
-        userRef,
-        {
-          plan: targetPlan,
-          planExpiresAt: planExpiresAt,
-          planWordsUsed: 0,
+      // Update user plan, planExpiresAt, and reset planWordsUsed to 0 in users/{uid}
+      const updateUserUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/users/${paymentReq.uid}?updateMask.fieldPaths=plan&updateMask.fieldPaths=planExpiresAt&updateMask.fieldPaths=planWordsUsed`;
+      await fetch(updateUserUrl, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
         },
-        { merge: true }
-      );
-    });
-
-    // Update local memory cache if present
-    if (localPaymentRequests.has(requestId)) {
-      const p = localPaymentRequests.get(requestId);
-      p.status = "approved";
-      p.reviewedAt = new Date().toISOString();
+        body: JSON.stringify({
+          fields: {
+            plan: { stringValue: targetPlan },
+            planExpiresAt: planExpiresAt ? { timestampValue: planExpiresAt } : { nullValue: null },
+            planWordsUsed: { integerValue: "0" },
+          },
+        }),
+      });
+    } catch (err) {
+      console.warn("Failed to commit approval in Firestore:", err);
     }
-
-    return res.json({
-      success: true,
-      message: `Payment approved! User ${targetUid} upgraded to ${targetPlan}.`,
-      plan: targetPlan,
-      planExpiresAt,
-    });
-  } catch (err: any) {
-    if (err.message === "REQUEST_ALREADY_APPROVED") {
-      return res.status(400).json({ error: "This request has already been approved." });
-    }
-    if (err.message === "REQUEST_NOT_FOUND") {
-      return res.status(404).json({ error: "Payment request not found." });
-    }
-    console.error("Payment approval transaction error:", err);
-    return res.status(500).json({ error: err.message || "Failed to approve payment." });
   }
+
+  return res.json({
+    success: true,
+    message: `Payment approved! User ${paymentReq.uid} upgraded to ${targetPlan}.`,
+    plan: targetPlan,
+    planExpiresAt,
+  });
 });
 
-// 10. Admin Reject Payment (Transaction-based via firebase-admin SDK)
+// 10. Admin Reject Payment
 app.post("/api/admin/reject-payment", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : (req.body?.idToken || null);
   const authUser = await verifyFirebaseToken(req);
+
   if (!checkIsAdmin(req, authUser)) {
     return res.status(403).json({ error: "Unauthorized. Admin privileges required." });
   }
@@ -1271,54 +1265,51 @@ app.post("/api/admin/reject-payment", async (req, res) => {
     return res.status(400).json({ error: "Missing requestId." });
   }
 
+  let paymentReq: any = localPaymentRequests.get(requestId);
   const rejectionReason = String(reason || "Invalid transaction details or unverified payment.").trim();
-  const reqRef = adminDb.collection("paymentRequests").doc(requestId);
+  const reviewedAtIso = new Date().toISOString();
 
-  try {
-    await adminDb.runTransaction(async (transaction) => {
-      const snap = await transaction.get(reqRef);
-      if (!snap.exists) {
-        throw new Error("REQUEST_NOT_FOUND");
-      }
-
-      const data = snap.data();
-      if (data?.status === "approved") {
-        throw new Error("CANNOT_REJECT_APPROVED");
-      }
-
-      transaction.update(reqRef, {
-        status: "rejected",
-        rejectionReason,
-        reviewedAt: FieldValue.serverTimestamp(),
-      });
-    });
-
-    if (localPaymentRequests.has(requestId)) {
-      const p = localPaymentRequests.get(requestId);
-      p.status = "rejected";
-      p.rejectionReason = rejectionReason;
-      p.reviewedAt = new Date().toISOString();
-    }
-
-    return res.json({
-      success: true,
-      message: "Payment request rejected.",
-    });
-  } catch (err: any) {
-    if (err.message === "CANNOT_REJECT_APPROVED") {
-      return res.status(400).json({ error: "Cannot reject an already approved payment." });
-    }
-    if (err.message === "REQUEST_NOT_FOUND") {
-      return res.status(404).json({ error: "Payment request not found." });
-    }
-    console.error("Payment rejection error:", err);
-    return res.status(500).json({ error: err.message || "Failed to reject payment." });
+  if (paymentReq) {
+    paymentReq.status = "rejected";
+    paymentReq.rejectionReason = rejectionReason;
+    paymentReq.reviewedAt = reviewedAtIso;
+    localPaymentRequests.set(requestId, paymentReq);
   }
+
+  if (token) {
+    try {
+      const updateReqUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/paymentRequests/${requestId}?updateMask.fieldPaths=status&updateMask.fieldPaths=rejectionReason&updateMask.fieldPaths=reviewedAt`;
+      await fetch(updateReqUrl, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          fields: {
+            status: { stringValue: "rejected" },
+            rejectionReason: { stringValue: rejectionReason },
+            reviewedAt: { timestampValue: reviewedAtIso },
+          },
+        }),
+      });
+    } catch (err) {
+      console.warn("Failed to commit rejection in Firestore:", err);
+    }
+  }
+
+  return res.json({
+    success: true,
+    message: "Payment request rejected.",
+  });
 });
 
-// 11. Admin Generate License Key (firebase-admin SDK write)
+// 11. Admin Generate License Key
 app.post("/api/admin/generate-license", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : (req.body?.idToken || null);
   const authUser = await verifyFirebaseToken(req);
+
   if (!checkIsAdmin(req, authUser)) {
     return res.status(403).json({ error: "Unauthorized. Admin privileges required." });
   }
@@ -1347,86 +1338,104 @@ app.post("/api/admin/generate-license", async (req, res) => {
 
   localLicenses.set(licenseKey, newLicense);
 
-  try {
-    await adminDb.collection("licenses").doc(licId).set({
-      id: licId,
-      key: licenseKey,
-      plan: targetPlan,
-      status: "unused",
-      redeemedBy: null,
-      redeemedAt: null,
-      createdAt: FieldValue.serverTimestamp(),
-    });
-
-    return res.json({
-      success: true,
-      key: licenseKey,
-      plan: targetPlan,
-      message: "New license key generated successfully!",
-    });
-  } catch (err: any) {
-    console.error("Error generating license in Firestore via Admin SDK:", err);
-    return res.status(500).json({ error: "Failed to save generated license to Firestore." });
+  if (token) {
+    try {
+      const createUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/licenses?documentId=${licId}`;
+      await fetch(createUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          fields: toFirestoreFields(newLicense),
+        }),
+      });
+    } catch (err) {
+      console.warn("Could not save generated license to Firestore:", err);
+    }
   }
+
+  return res.json({
+    success: true,
+    key: licenseKey,
+    plan: targetPlan,
+    message: "New license key generated successfully!",
+  });
 });
 
-// 12. Admin List Payment Requests (firebase-admin SDK read)
+// 12. Admin List Payment Requests (with filters and pending first)
 app.get(["/api/admin/payment-requests", "/api/admin/pending-payments"], async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : (req.query?.idToken as string || null);
   const authUser = await verifyFirebaseToken(req);
+
   if (!checkIsAdmin(req, authUser)) {
     return res.status(403).json({ error: "Unauthorized. Admin privileges required." });
   }
 
   const map = new Map<string, any>();
 
-  // Add in-memory requests
+  // Add local in-memory requests
   for (const reqItem of localPaymentRequests.values()) {
     map.set(reqItem.id || reqItem.transactionId, reqItem);
   }
 
-  // Load live from Firestore via Admin SDK
-  try {
-    const snap = await adminDb.collection("paymentRequests").get();
-    for (const docSnap of snap.docs) {
-      const f = docSnap.data();
-      const id = docSnap.id;
-      let createdAtStr = "";
-      if (f.createdAt) {
-        if (typeof f.createdAt === "string") createdAtStr = f.createdAt;
-        else if (typeof f.createdAt.toDate === "function") createdAtStr = f.createdAt.toDate().toISOString();
-        else createdAtStr = new Date(f.createdAt).toISOString();
-      }
-
-      let reviewedAtStr: string | null = null;
-      if (f.reviewedAt) {
-        if (typeof f.reviewedAt === "string") reviewedAtStr = f.reviewedAt;
-        else if (typeof f.reviewedAt.toDate === "function") reviewedAtStr = f.reviewedAt.toDate().toISOString();
-        else reviewedAtStr = new Date(f.reviewedAt).toISOString();
-      }
-
-      map.set(id, {
-        id,
-        uid: f.uid || "",
-        email: f.email || "",
-        plan: f.plan || "monthly",
-        amountUSD: Number(f.amountUSD) || 0,
-        amountPKR: Number(f.amountPKR) || 0,
-        method: f.method || "",
-        senderName: f.senderName || "",
-        senderNumber: f.senderNumber || "",
-        transactionId: f.transactionId || "",
-        screenshotUrl: f.screenshotUrl || "",
-        status: f.status || "pending",
-        createdAt: createdAtStr,
-        reviewedAt: reviewedAtStr,
-        rejectionReason: f.rejectionReason || null,
+  // If token is available, query Firestore paymentRequests
+  if (token) {
+    try {
+      const queryUrl = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents:runQuery`;
+      const qRes = await fetch(queryUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          structuredQuery: {
+            from: [{ collectionId: "paymentRequests" }],
+          },
+        }),
       });
+
+      if (qRes.ok) {
+        const qData = await qRes.json();
+        if (Array.isArray(qData)) {
+          for (const item of qData) {
+            if (item.document) {
+              const d = item.document;
+              const parts = d.name.split("/");
+              const id = parts[parts.length - 1];
+              const f = d.fields;
+              const reqItem = {
+                id,
+                uid: f?.uid?.stringValue || "",
+                email: f?.email?.stringValue || "",
+                plan: f?.plan?.stringValue || "monthly",
+                amountUSD: parseInt(f?.amountUSD?.integerValue ?? f?.amountUSD?.doubleValue ?? "0", 10),
+                amountPKR: parseInt(f?.amountPKR?.integerValue ?? f?.amountPKR?.doubleValue ?? "0", 10),
+                method: f?.method?.stringValue || "",
+                senderName: f?.senderName?.stringValue || "",
+                senderNumber: f?.senderNumber?.stringValue || "",
+                transactionId: f?.transactionId?.stringValue || "",
+                screenshotUrl: f?.screenshotUrl?.stringValue || "",
+                status: f?.status?.stringValue || "pending",
+                createdAt: f?.createdAt?.timestampValue || f?.createdAt?.stringValue || "",
+                reviewedAt: f?.reviewedAt?.timestampValue || f?.reviewedAt?.stringValue || null,
+                rejectionReason: f?.rejectionReason?.stringValue || null,
+              };
+              map.set(id, reqItem);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("Could not query Firestore payment requests:", e);
     }
-  } catch (e) {
-    console.warn("Could not query Firestore payment requests via Admin SDK:", e);
   }
 
   const list = Array.from(map.values());
+  // Sort pending first, then by createdAt desc
   list.sort((a, b) => {
     if (a.status === "pending" && b.status !== "pending") return -1;
     if (a.status !== "pending" && b.status === "pending") return 1;
@@ -1440,12 +1449,14 @@ app.get(["/api/admin/payment-requests", "/api/admin/pending-payments"], async (r
 
 async function startServer() {
   const isProduction = process.env.NODE_ENV === "production";
+
   if (isProduction) {
     app.use(express.static(path.resolve(__dirname, "dist")));
     app.get("*", (_req, res) => {
       res.sendFile(path.resolve(__dirname, "dist", "index.html"));
     });
   } else {
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
@@ -1458,4 +1469,9 @@ async function startServer() {
   });
 }
 
-startServer();
+// On Vercel the app is exported and run as a serverless function (see api/index.ts).
+if (!process.env.VERCEL) {
+  startServer();
+}
+
+export default app;

@@ -1,6 +1,0 @@
-{
-  "name": "SM Voice Studio – SHANI MUGHAL",
-  "description": "Text-to-Speech web app for long scripts and cinematic voiceovers powered by Google Gemini TTS.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}

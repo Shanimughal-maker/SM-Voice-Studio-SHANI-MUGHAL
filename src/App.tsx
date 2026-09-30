@@ -7,7 +7,6 @@ import React, { useState, useRef, useMemo, useEffect } from "react";
 import {
   GEMINI_VOICES,
   TTS_MODELS,
-  TEXT_MODEL,
   LANGUAGES,
   ACCENTS_BY_LANGUAGE,
   VOICE_STYLES,
@@ -19,8 +18,9 @@ import {
   splitSingleSpeakerScript,
   splitTwoSpeakerScript,
   mergePcmChunks,
-  sendGeminiRequest,
   requestChunkAudio,
+  sendServerTranslation,
+  sendServerTranscription,
   executeWithQuotaRetry,
   cancellableSleep,
   type GeminiVoice,
@@ -47,73 +47,127 @@ import {
   CheckCircle2,
   Upload,
   Languages,
-  Radio,
   FileAudio,
   ArrowRight,
   ShieldCheck,
   AlertCircle,
+  CreditCard,
   X,
-  Lock,
-  Unlock,
 } from "lucide-react";
+import {
+  auth,
+  ensureUserProfile,
+  subscribeUserProfile,
+  recordServerUsage,
+  loadPricingSettings,
+  loadPaymentMethods,
+  subscribePaymentRequests,
+  DEFAULT_PRICING,
+  DEFAULT_PAYMENT_METHODS,
+  type UserProfile,
+  type User,
+  type PlanType,
+  type PricingSettings,
+  type PaymentMethodItem,
+  type PaymentRequest,
+  onAuthStateChanged,
+} from "./utils/firebase";
+import { AuthScreen } from "./components/AuthScreen";
+import { UsageHeader } from "./components/UsageHeader";
+import { UpgradeModal } from "./components/UpgradeModal";
+import { PricingSection } from "./components/PricingSection";
+import { ManualPaymentModal } from "./components/ManualPaymentModal";
+import { PaymentRequestsList } from "./components/PaymentRequestsList";
+import { RedeemLicenseCard } from "./components/RedeemLicenseCard";
+import { AdminPaymentPanel } from "./components/AdminPaymentPanel";
 
 export default function App() {
   // Developer title check
   useEffect(() => {
-    document.title = "SM Voice Studio — SHANI MUGHAL";
+    document.title = "SM Voice Studio – SHANI MUGHAL";
   }, []);
 
-  // Access Lock Passcode
-  const APP_ACCESS_PASSCODE = "Shani Mughal From Sargodha";
-  const [isUnlocked, setIsUnlocked] = useState<boolean>(() => {
-    try {
-      return (
-        sessionStorage.getItem("sm_app_unlocked") === "true" ||
-        localStorage.getItem("sm_app_unlocked") === "true"
-      );
-    } catch {
-      return false;
-    }
-  });
-  const [passcodeAttempt, setPasscodeAttempt] = useState<string>("");
-  const [passcodeError, setPasscodeError] = useState<string | null>(null);
-  const [rememberUnlock, setRememberUnlock] = useState<boolean>(false);
-  const [showPasscodeText, setShowPasscodeText] = useState<boolean>(false);
+  // Firebase User Authentication & Quota State
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [isAuthLoading, setIsAuthLoading] = useState<boolean>(true);
+  const [isUpgradeModalOpen, setIsUpgradeModalOpen] = useState<boolean>(false);
 
-  const handleUnlockApp = (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    if (passcodeAttempt.trim() === APP_ACCESS_PASSCODE) {
-      setIsUnlocked(true);
-      setPasscodeError(null);
-      try {
-        sessionStorage.setItem("sm_app_unlocked", "true");
-        if (rememberUnlock) {
-          localStorage.setItem("sm_app_unlocked", "true");
+  // Pricing & Payments State
+  const [pricingSettings, setPricingSettings] = useState<PricingSettings>(DEFAULT_PRICING);
+  const [paymentMethods, setPaymentMethods] = useState<PaymentMethodItem[]>(DEFAULT_PAYMENT_METHODS);
+  const [userPaymentRequests, setUserPaymentRequests] = useState<PaymentRequest[]>([]);
+  const [isPaymentModalOpen, setIsPaymentModalOpen] = useState<boolean>(false);
+  const [selectedPlanForPayment, setSelectedPlanForPayment] = useState<PlanType>("monthly");
+  const [selectedPriceUSD, setSelectedPriceUSD] = useState<number>(2);
+  const [selectedPricePKR, setSelectedPricePKR] = useState<number>(560);
+
+  const userPendingPaymentsCount = useMemo(() => {
+    return userPaymentRequests.filter((r) => r.status === "pending").length;
+  }, [userPaymentRequests]);
+
+  // Load pricing & payment methods settings on startup
+  useEffect(() => {
+    loadPricingSettings().then((p) => setPricingSettings(p));
+    loadPaymentMethods().then((m) => setPaymentMethods(m));
+  }, []);
+
+  // Real-time listener for user's payment requests
+  useEffect(() => {
+    if (!currentUser) {
+      setUserPaymentRequests([]);
+      return;
+    }
+    const unsub = subscribePaymentRequests(
+      currentUser.uid,
+      (requests) => setUserPaymentRequests(requests)
+    );
+    return () => unsub();
+  }, [currentUser]);
+
+  // Monitor Firebase auth state
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      setCurrentUser(user);
+      if (user) {
+        try {
+          const profile = await ensureUserProfile(user);
+          setUserProfile(profile);
+        } catch (e) {
+          console.error("Error initializing user profile:", e);
         }
-      } catch {}
-    } else {
-      setPasscodeError("Invalid passcode! Access denied. Enter the correct lock key.");
-    }
-  };
+      } else {
+        setUserProfile(null);
+      }
+      setIsAuthLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
 
-  const handleLockApp = () => {
-    try {
-      sessionStorage.removeItem("sm_app_unlocked");
-      localStorage.removeItem("sm_app_unlocked");
-    } catch {}
-    setIsUnlocked(false);
-    setPasscodeAttempt("");
-    setPasscodeError(null);
-  };
+  // Real-time listener for user profile & quota changes from Firestore
+  useEffect(() => {
+    if (!currentUser) return;
+    const unsub = subscribeUserProfile(
+      currentUser.uid,
+      (profile) => {
+        if (profile) {
+          setUserProfile(profile);
+        }
+      },
+      (err) => {
+        console.warn("User profile listener:", err);
+      }
+    );
+    return () => unsub();
+  }, [currentUser?.uid]);
 
-  // Active tab: 'studio' | 'translate'
-  const [activeTab, setActiveTab] = useState<"studio" | "translate">("studio");
+  // Active tab: 'studio' | 'translate' | 'account'
+  const [activeTab, setActiveTab] = useState<"studio" | "translate" | "account">("studio");
 
   // First-time dismissible note
   const [showFirstTimeNote, setShowFirstTimeNote] = useState<boolean>(() => {
     return localStorage.getItem("sm_hide_first_time_note") !== "true";
   });
-
   const handleDismissFirstTimeNote = () => {
     setShowFirstTimeNote(false);
     localStorage.setItem("sm_hide_first_time_note", "true");
@@ -140,9 +194,7 @@ export default function App() {
     if (!clean) {
       setActiveUserApiKey(null);
       localStorage.removeItem("sm_gemini_user_key");
-      setErrorMessage(
-        "Enter your Gemini API key to start. You can get a free key from aistudio.google.com/apikey"
-      );
+      setErrorMessage("Please add your own Gemini API key to continue.");
       return;
     }
     setActiveUserApiKey(clean);
@@ -215,13 +267,11 @@ export default function App() {
   const [isTwoSpeaker, setIsTwoSpeaker] = useState<boolean>(false);
   const [singleVoice, setSingleVoice] = useState<GeminiVoice>("Charon");
   const [genderFilter, setGenderFilter] = useState<"All" | "Male" | "Female">("All");
-
   const [speaker1, setSpeaker1] = useState<{ name: string; voice: GeminiVoice }>({
     name: "Speaker1",
     voice: "Charon",
   });
   const [speaker1GenderFilter, setSpeaker1GenderFilter] = useState<"All" | "Male" | "Female">("All");
-
   const [speaker2, setSpeaker2] = useState<{ name: string; voice: GeminiVoice }>({
     name: "Speaker2",
     voice: "Aoede",
@@ -327,7 +377,7 @@ export default function App() {
   const [translateProgress, setTranslateProgress] = useState<string>("");
   const audioFileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Key availability check: true only when visitor entered a valid key
+  // Key availability check
   const isKeyAvailable = Boolean(activeUserApiKey && activeUserApiKey.trim().length > 0);
 
   // Script stats
@@ -370,7 +420,6 @@ export default function App() {
   // 1. Play Preview
   const handlePlayPreview = async (speakerNum?: 1 | 2 | React.MouseEvent) => {
     setErrorMessage(null);
-
     if (isPreviewPlaying && previewAudioRef.current) {
       previewAudioRef.current.pause();
       previewAudioRef.current.currentTime = 0;
@@ -380,9 +429,7 @@ export default function App() {
     }
 
     if (!isKeyAvailable) {
-      setErrorMessage(
-        "Enter your Gemini API key to start. You can get a free key from aistudio.google.com/apikey"
-      );
+      setErrorMessage("Please add your own Gemini API key to continue.");
       return;
     }
 
@@ -406,6 +453,7 @@ export default function App() {
         : speaker1.voice
       : singleVoice;
 
+    const idToken = await currentUser?.getIdToken();
     const { result: pcmResult, error: previewErr } =
       await executeWithQuotaRetry(() =>
         requestChunkAudio(
@@ -415,12 +463,12 @@ export default function App() {
           false,
           voiceToTest,
           speaker1,
-          speaker2
+          speaker2,
+          idToken
         )
       );
 
     setIsPreviewLoading(false);
-
     if (previewErr || !pcmResult) {
       setPreviewSpeakerNum(null);
       setErrorMessage(
@@ -442,7 +490,6 @@ export default function App() {
 
       const audio = new Audio(previewUrl);
       previewAudioRef.current = audio;
-
       audio.onplay = () => setIsPreviewPlaying(true);
       audio.onended = () => {
         setIsPreviewPlaying(false);
@@ -454,7 +501,6 @@ export default function App() {
         setPreviewSpeakerNum(null);
         URL.revokeObjectURL(previewUrl);
       };
-
       await audio.play();
     } catch {
       setIsPreviewPlaying(false);
@@ -466,17 +512,49 @@ export default function App() {
   // 2. Generate Voiceover with Chunking, Stop Support & Silent Retry
   const handleGenerateVoiceover = async () => {
     setErrorMessage(null);
-
     if (!isKeyAvailable) {
-      setErrorMessage(
-        "Enter your Gemini API key to start. You can get a free key from aistudio.google.com/apikey"
-      );
+      setErrorMessage("Please add your own Gemini API key to continue.");
       return;
     }
 
     if (!scriptText.trim()) {
       setErrorMessage("Please paste or enter your script first.");
       return;
+    }
+
+    // Quota Enforcement Check
+    const scriptChars = scriptText.trim().length;
+    if (userProfile?.plan === "free") {
+      const used = userProfile.charactersUsed || 0;
+      const limit = userProfile.freeLimit || 10000;
+      const remaining = Math.max(0, limit - used);
+      if (remaining <= 0) {
+        setErrorMessage(
+          `Free plan quota limit reached (${used.toLocaleString()} / ${limit.toLocaleString()} characters used). Please upgrade to Pro to continue.`
+        );
+        return;
+      }
+      if (scriptChars > remaining) {
+        setErrorMessage(
+          `Your script has ${scriptChars.toLocaleString()} characters, but you only have ${remaining.toLocaleString()} free characters remaining in your quota. Please shorten your script or upgrade your plan.`
+        );
+        return;
+      }
+    } else if (
+      userProfile?.plan === "pro_monthly" ||
+      userProfile?.plan === "monthly" ||
+      userProfile?.plan === "pro_3months" ||
+      userProfile?.plan === "quarterly"
+    ) {
+      if (
+        userProfile.planExpiresAt &&
+        new Date(userProfile.planExpiresAt).getTime() < Date.now()
+      ) {
+        setErrorMessage(
+          "Your Pro subscription plan has expired. Please renew your subscription to continue generating speech."
+        );
+        return;
+      }
     }
 
     const chunks = isTwoSpeaker
@@ -504,7 +582,6 @@ export default function App() {
     // Check each chunk against IndexedDB cache for resume support
     const chunkHashes: string[] = [];
     const cachedChunks: ({ pcmBytes: Uint8Array; sampleRate: number } | null)[] = [];
-
     for (const chunk of chunks) {
       const hash = await computeChunkHash({
         text: chunk,
@@ -540,7 +617,6 @@ export default function App() {
       );
       setProgressPercent(Math.round(((i + 1) / chunks.length) * 100));
 
-      // Skip chunks that are already stored in IndexedDB
       if (cached) {
         pcmChunks.push(cached.pcmBytes);
         if (cached.sampleRate) {
@@ -557,6 +633,7 @@ export default function App() {
         selectedPace
       );
 
+      const idToken = await currentUser?.getIdToken();
       const { result: pcmResult, error: chunkErr } =
         await executeWithQuotaRetry(
           () =>
@@ -567,7 +644,8 @@ export default function App() {
               isTwoSpeaker,
               singleVoice,
               speaker1,
-              speaker2
+              speaker2,
+              idToken
             ),
           () => isCancelledRef.current
         );
@@ -576,37 +654,53 @@ export default function App() {
         break;
       }
 
-      // If chunk fails after retries or quota error
       if (chunkErr || !pcmResult) {
-        setErrorMessage(
-          chunkErr || `Error processing chunk ${i + 1}. Please check your API key or quota.`
-        );
+        if (chunkErr?.includes("Free limit reached")) {
+          setErrorMessage("Free limit reached. Upgrade to continue.");
+        } else {
+          setErrorMessage(
+            chunkErr || `Error processing chunk ${i + 1}. Please check your API key or quota.`
+          );
+        }
         break;
       }
 
-      // Store finished chunk's audio in IndexedDB
       await saveCachedChunk(hash, pcmResult.pcmBytes, pcmResult.sampleRate);
       alreadyDoneCount++;
       setSavedProgressCount((prev) => prev + 1);
-
       pcmChunks.push(pcmResult.pcmBytes);
       if (pcmResult.sampleRate) {
         detectedSampleRate = pcmResult.sampleRate;
       }
 
-      // Rate limit prevention: wait between each chunk request based on selected tier
-      // Do NOT wait after the last chunk
       if (i < chunks.length - 1 && !isCancelledRef.current) {
         await cancellableSleep(waitBetweenChunks, () => isCancelledRef.current);
       }
     }
 
-    // Finished or stopped: offer audio finished so far if any chunks were completed
     if (pcmChunks.length > 0) {
       try {
         const mergedBlob = mergePcmChunks(pcmChunks, detectedSampleRate);
         const mergedUrl = URL.createObjectURL(mergedBlob);
         setGeneratedAudioUrl(mergedUrl);
+
+        if (currentUser && alreadyDoneCount > 0) {
+          const usedChars = Math.min(
+            scriptChars,
+            Math.round((alreadyDoneCount / chunks.length) * scriptChars)
+          );
+          if (usedChars > 0) {
+            recordServerUsage(currentUser, usedChars);
+            setUserProfile((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    charactersUsed: (prev.charactersUsed || 0) + usedChars,
+                  }
+                : prev
+            );
+          }
+        }
       } catch {
         setErrorMessage("Failed to assemble the merged audio file.");
       }
@@ -641,18 +735,11 @@ export default function App() {
   const handleLoadSample = () => {
     if (isTwoSpeaker) {
       setScriptText(
-        `Speaker1: [whispering] Do you hear that echo across the valley? Something massive is approaching the frozen ridge.
-Speaker2: [cautiously] Yes, the ground is trembling beneath our feet. Keep your torches burning bright.
-Speaker1: [dramatically] Look toward the horizon! The great mammoth herd has arrived, breaking through the ancient blizzard.
-Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of this magnitude.`
+        `Speaker1: [whispering] Do you hear that echo across the valley? Something massive is approaching the frozen ridge.\nSpeaker2: [cautiously] Yes, the ground is trembling beneath our feet. Keep your torches burning bright.\nSpeaker1: [dramatically] Look toward the horizon! The great mammoth herd has arrived, breaking through the ancient blizzard.\nSpeaker2: [in awe] In all my fifty years, I have never witnessed a migration of this magnitude.`
       );
     } else {
       setScriptText(
-        `[slowly] Across the untamed plains of the late Pleistocene, the wind howls through a desolate canyon of ice and rock. [pause] For fifty thousand years, the great mammoth herds reigned supreme, their thunderous footsteps shaking the permafrost.
-
-[whispering] But deep inside the shadows, an unseen predator waits patiently. [pause] Keen eyes observe every subtle shift in the blowing snow.
-
-[dramatically] Survival here demands relentless focus. Every step could be the difference between enduring another harsh winter or vanishing forever into ancient legend. [pause] This is the story of the earth before mankind claimed the dawn.`
+        `[slowly] Across the untamed plains of the late Pleistocene, the wind howls through a desolate canyon of ice and rock. [pause] For fifty thousand years, the great mammoth herds reigned supreme, their thunderous footsteps shaking the permafrost. [whispering] But deep inside the shadows, an unseen predator waits patiently. [pause] Keen eyes observe every subtle shift in the blowing snow. [dramatically] Survival here demands relentless focus. Every step could be the difference between enduring another harsh winter or vanishing forever into ancient legend. [pause] This is the story of the earth before mankind claimed the dawn.`
       );
     }
   };
@@ -660,30 +747,57 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
   // 3. Translate & Dub Handler
   const handleTranslateAndDub = async () => {
     setErrorMessage(null);
-
     if (!isKeyAvailable) {
-      setErrorMessage(
-        "Enter your Gemini API key to start. You can get a free key from aistudio.google.com/apikey"
-      );
+      setErrorMessage("Please add your own Gemini API key to continue.");
       return;
     }
 
-    let textToTranslate = "";
+    if (userProfile?.plan === "free") {
+      const used = userProfile.charactersUsed || 0;
+      const limit = userProfile.freeLimit || 10000;
+      const remaining = Math.max(0, limit - used);
+      if (remaining <= 0) {
+        setErrorMessage(
+          `Free plan quota limit reached (${used.toLocaleString()} / ${limit.toLocaleString()} characters used). Please upgrade to Pro to continue.`
+        );
+        return;
+      }
+    } else if (
+      userProfile?.plan === "pro_monthly" ||
+      userProfile?.plan === "monthly" ||
+      userProfile?.plan === "pro_3months" ||
+      userProfile?.plan === "quarterly"
+    ) {
+      if (
+        userProfile.planExpiresAt &&
+        new Date(userProfile.planExpiresAt).getTime() < Date.now()
+      ) {
+        setErrorMessage(
+          "Your Pro subscription plan has expired. Please renew your subscription to continue."
+        );
+        return;
+      }
+    }
 
+    let textToTranslate = "";
     setIsTranslating(true);
     setTranslateProgress("Initializing...");
 
     try {
+      const idToken = await currentUser?.getIdToken();
+      if (!idToken) {
+        setErrorMessage("Please sign in to continue.");
+        setIsTranslating(false);
+        return;
+      }
+
       if (translateMode === "audio") {
         if (!uploadedAudioFile) {
           setErrorMessage("Please select an audio file to translate.");
           setIsTranslating(false);
           return;
         }
-
         setTranslateProgress("Transcribing audio word for word...");
-
-        // Read audio file as base64
         const audioBase64 = await new Promise<string>((resolve, reject) => {
           const reader = new FileReader();
           reader.onload = () => {
@@ -695,36 +809,13 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
           reader.readAsDataURL(uploadedAudioFile);
         });
 
-        const transcribeBody = {
-          contents: [
-            {
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: uploadedAudioFile.type || "audio/mp3",
-                    data: audioBase64,
-                  },
-                },
-                {
-                  text: "Transcribe this audio word for word with accurate punctuation. Preserve any natural pauses as stage directions in brackets like [pause]. Return only the raw transcription without introduction.",
-                },
-              ],
-            },
-          ],
-        };
-
-        const { result: transcribeRes, error: transcribeErr } =
-          await executeWithQuotaRetry(() =>
-            sendGeminiRequest(TEXT_MODEL, activeUserApiKey, transcribeBody)
-          );
-
-        if (transcribeErr || !transcribeRes) {
-          throw new Error(transcribeErr || "Transcription failed.");
-        }
-
-        textToTranslate =
-          transcribeRes.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
-
+        const transcript = await sendServerTranscription(
+          idToken,
+          activeUserApiKey || "",
+          audioBase64,
+          uploadedAudioFile.type || "audio/mp3"
+        );
+        textToTranslate = transcript.trim();
         if (!textToTranslate) {
           throw new Error("Could not extract speech transcript from the audio.");
         }
@@ -737,7 +828,6 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
         }
       }
 
-      // Split text into pieces of ~3000 characters for translation
       const translationPieces = splitSingleSpeakerScript(textToTranslate, 3000);
       const translatedPieces: string[] = [];
 
@@ -745,30 +835,17 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
         setTranslateProgress(
           `Translating part ${i + 1} of ${translationPieces.length}...`
         );
-
         const piece = translationPieces[i];
-        const translatePrompt = `Translate the following text into ${translateTargetLang}. STRICT RULE: Keep any [bracketed stage directions] like [pause], [slowly], or [dramatically] completely unchanged and untranslated in their exact positions. Return ONLY the translated text without commentary or quotation marks.\n\nText:\n${piece}`;
-
-        const translateBody = {
-          contents: [{ parts: [{ text: translatePrompt }] }],
-        };
-
-        const { result: trRes, error: trErr } = await executeWithQuotaRetry(
-          () => sendGeminiRequest(TEXT_MODEL, activeUserApiKey, translateBody)
+        const translatedChunk = await sendServerTranslation(
+          idToken,
+          activeUserApiKey || "",
+          piece,
+          translateTargetLang
         );
-
-        if (trErr || !trRes) {
-          throw new Error(trErr || `Translation failed on part ${i + 1}.`);
-        }
-
-        const translatedChunk =
-          trRes.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
-
         translatedPieces.push(translatedChunk);
 
-        // 13000ms wait between translation requests (free tier text models allow 5 requests/min)
         if (i < translationPieces.length - 1) {
-          await new Promise((r) => setTimeout(r, 13000));
+          await new Promise((r) => setTimeout(r, 2000));
         }
       }
 
@@ -776,9 +853,12 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
       setTranslatedResultText(fullTranslation);
       setTranslateProgress("");
     } catch (err: any) {
-      setErrorMessage(
-        err?.message || "Translation failed. Please verify your API key."
-      );
+      const msg = err?.message || "Translation failed.";
+      if (msg.includes("Free limit reached")) {
+        setErrorMessage("Free limit reached. Upgrade to continue.");
+      } else {
+        setErrorMessage(msg);
+      }
       setTranslateProgress("");
     } finally {
       setIsTranslating(false);
@@ -788,7 +868,6 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
   const handleUseInVoiceover = () => {
     if (translatedResultText) {
       setScriptText(translatedResultText);
-      // Auto-set the studio language to target language if matching
       if (LANGUAGES.includes(translateTargetLang as any)) {
         setSelectedLanguage(translateTargetLang);
       }
@@ -796,106 +875,24 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
     }
   };
 
-  if (!isUnlocked) {
+  if (isAuthLoading) {
     return (
-      <div className="min-h-screen bg-[#090d16] text-slate-200 flex flex-col justify-between selection:bg-amber-500/30 selection:text-amber-200 relative overflow-hidden">
-        {/* Background ambient lighting */}
-        <div className="fixed inset-0 pointer-events-none overflow-hidden">
-          <div className="absolute -top-40 left-1/2 -translate-x-1/2 w-[700px] h-[350px] bg-amber-500/10 rounded-full blur-3xl" />
-          <div className="absolute bottom-10 -right-40 w-[500px] h-[500px] bg-amber-600/5 rounded-full blur-3xl" />
+      <div className="min-h-screen bg-[#090d16] text-slate-200 flex flex-col items-center justify-center relative overflow-hidden">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-8 h-8 border-2 border-amber-400 border-t-transparent rounded-full animate-spin" />
+          <span className="font-cinematic text-lg font-bold tracking-wide text-transparent bg-clip-text bg-gradient-to-r from-amber-200 via-amber-400 to-amber-100">
+            SM Voice Studio
+          </span>
+          <span className="text-[11px] uppercase tracking-widest text-amber-500/70 font-medium">
+            Loading studio session...
+          </span>
         </div>
-
-        <div className="relative z-10 flex-1 flex items-center justify-center p-4 sm:p-6">
-          <div className="w-full max-w-md bg-[#0a0e1a]/95 border border-slate-800/90 rounded-2xl p-6 sm:p-8 shadow-2xl backdrop-blur-md">
-            <div className="text-center mb-6">
-              <div className="w-14 h-14 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400 mb-3.5 mx-auto shadow-lg shadow-amber-500/10">
-                <Lock className="w-7 h-7 text-amber-400" />
-              </div>
-              <h1 className="font-cinematic text-2xl sm:text-3xl font-bold tracking-wide text-transparent bg-clip-text bg-gradient-to-r from-amber-200 via-amber-400 to-amber-100">
-                SM Voice Studio
-              </h1>
-              <p className="text-xs uppercase tracking-widest text-amber-500/90 font-medium mt-1">
-                Developed by SHANI MUGHAL
-              </p>
-              <div className="mt-4 p-3 rounded-xl bg-slate-900/60 border border-slate-800/80">
-                <p className="text-xs text-slate-300 leading-relaxed">
-                  Yeh web app password protected hai. Access hasil karne k liye lock passcode darj karein.
-                </p>
-              </div>
-            </div>
-
-            <form onSubmit={handleUnlockApp} className="space-y-4">
-              <div className="space-y-1.5">
-                <label className="text-xs font-semibold uppercase tracking-wider text-slate-300">
-                  Access Passcode
-                </label>
-                <div className="relative">
-                  <input
-                    type={showPasscodeText ? "text" : "password"}
-                    value={passcodeAttempt}
-                    onChange={(e) => {
-                      setPasscodeAttempt(e.target.value);
-                      if (passcodeError) setPasscodeError(null);
-                    }}
-                    placeholder="Enter lock passcode..."
-                    autoFocus
-                    className="w-full bg-[#0d1220] border border-slate-800 rounded-xl px-3.5 py-2.5 pr-10 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-amber-500/60 transition-colors"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowPasscodeText(!showPasscodeText)}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 p-1"
-                    title={showPasscodeText ? "Hide passcode" : "Show passcode"}
-                  >
-                    {showPasscodeText ? (
-                      <EyeOff className="w-4 h-4" />
-                    ) : (
-                      <Eye className="w-4 h-4" />
-                    )}
-                  </button>
-                </div>
-              </div>
-
-              {passcodeError && (
-                <div className="flex items-center gap-2 p-2.5 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-400">
-                  <AlertCircle className="w-4 h-4 shrink-0" />
-                  <span>{passcodeError}</span>
-                </div>
-              )}
-
-              <div className="flex items-center gap-2 text-xs">
-                <input
-                  type="checkbox"
-                  id="rememberUnlock"
-                  checked={rememberUnlock}
-                  onChange={(e) => setRememberUnlock(e.target.checked)}
-                  className="rounded border-slate-700 bg-slate-900 text-amber-500 focus:ring-0 cursor-pointer accent-amber-500"
-                />
-                <label
-                  htmlFor="rememberUnlock"
-                  className="cursor-pointer select-none text-slate-400"
-                >
-                  Remember unlock on this browser
-                </label>
-              </div>
-
-              <button
-                type="submit"
-                className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-sm font-semibold bg-amber-400 hover:bg-amber-300 text-slate-950 shadow-md shadow-amber-500/10 transition-all cursor-pointer font-medium"
-              >
-                <Unlock className="w-4 h-4" />
-                <span>Unlock Studio</span>
-              </button>
-            </form>
-          </div>
-        </div>
-
-        {/* Developer Credit 2: Subtle, always-visible footer centered at bottom */}
-        <footer className="relative z-10 py-4 text-center text-xs tracking-wider text-amber-500/70 border-t border-slate-800/80 bg-[#090d16]/90">
-          © Developed by SHANI MUGHAL
-        </footer>
       </div>
     );
+  }
+
+  if (!currentUser) {
+    return <AuthScreen onAuthSuccess={() => setIsAuthLoading(false)} />;
   }
 
   return (
@@ -907,34 +904,25 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
       </div>
 
       <div className="relative z-10 max-w-4xl mx-auto w-full px-4 sm:px-6 py-6 sm:py-10 flex-1 flex flex-col">
-        {/* Top utilities bar with Lock button */}
-        <div className="flex items-center justify-between gap-3 mb-4">
-          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-400 text-xs font-medium tracking-wider uppercase">
-            <Sparkles className="w-3.5 h-3.5" />
-            Gemini TTS Studio
-          </div>
-          <button
-            type="button"
-            onClick={handleLockApp}
-            className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-slate-900/80 border border-slate-800 hover:border-amber-500/40 text-slate-400 hover:text-amber-400 text-xs font-medium transition-all cursor-pointer shadow-sm"
-            title="Lock Studio"
-          >
-            <Lock className="w-3.5 h-3.5 text-amber-400" />
-            <span>Lock Studio</span>
-          </button>
-        </div>
+        {/* Top User & Usage Quota Bar */}
+        <UsageHeader
+          userEmail={currentUser.email}
+          profile={userProfile}
+          onSignOut={() => {
+            setCurrentUser(null);
+            setUserProfile(null);
+          }}
+          onUpgradeClick={() => setActiveTab("account")}
+        />
 
         {/* Main Header with Developer Credit 1 */}
         <header className="text-center mb-6 sm:mb-8">
           <h1 className="font-cinematic text-3xl sm:text-4xl md:text-5xl font-bold tracking-wide text-transparent bg-clip-text bg-gradient-to-r from-amber-200 via-amber-400 to-amber-100">
             SM Voice Studio
           </h1>
-
-          {/* Developer Credit 1: Directly under the main heading */}
           <p className="text-xs sm:text-sm uppercase tracking-widest text-amber-500/90 font-medium mt-1">
             Developed by SHANI MUGHAL
           </p>
-
           <p className="text-xs sm:text-sm text-slate-400 mt-2 max-w-xl mx-auto">
             Professional multi-speaker & cinematic voiceovers for 30+ minute
             narrations with auto-chunking, multi-lingual dubbing, and seamless WAV
@@ -961,11 +949,11 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
         )}
 
         {/* Tab Navigation */}
-        <div className="flex items-center justify-center gap-3 mb-6">
+        <div className="flex items-center justify-center gap-2 sm:gap-3 mb-6 flex-wrap">
           <button
             type="button"
             onClick={() => setActiveTab("studio")}
-            className={`px-5 py-2 rounded-xl text-xs sm:text-sm font-semibold tracking-wide transition-all ${
+            className={`px-4 sm:px-5 py-2 rounded-xl text-xs sm:text-sm font-semibold tracking-wide transition-all ${
               activeTab === "studio"
                 ? "bg-amber-400 text-slate-950 shadow-md shadow-amber-500/20"
                 : "bg-[#101524] text-slate-400 hover:text-slate-200 border border-slate-800"
@@ -976,7 +964,7 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
           <button
             type="button"
             onClick={() => setActiveTab("translate")}
-            className={`px-5 py-2 rounded-xl text-xs sm:text-sm font-semibold tracking-wide transition-all flex items-center gap-1.5 ${
+            className={`px-4 sm:px-5 py-2 rounded-xl text-xs sm:text-sm font-semibold tracking-wide transition-all flex items-center gap-1.5 ${
               activeTab === "translate"
                 ? "bg-amber-400 text-slate-950 shadow-md shadow-amber-500/20"
                 : "bg-[#101524] text-slate-400 hover:text-slate-200 border border-slate-800"
@@ -984,6 +972,23 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
           >
             <Languages className="w-3.5 h-3.5" />
             Translate & Dub
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab("account")}
+            className={`px-4 sm:px-5 py-2 rounded-xl text-xs sm:text-sm font-semibold tracking-wide transition-all flex items-center gap-1.5 ${
+              activeTab === "account"
+                ? "bg-amber-400 text-slate-950 shadow-md shadow-amber-500/20"
+                : "bg-[#101524] text-slate-400 hover:text-slate-200 border border-slate-800"
+            }`}
+          >
+            <CreditCard className="w-3.5 h-3.5" />
+            <span>Plans & Account</span>
+            {userPendingPaymentsCount > 0 && (
+              <span className="px-1.5 py-0.5 rounded-full bg-rose-500 text-white font-bold text-[10px] animate-pulse">
+                {userPendingPaymentsCount}
+              </span>
+            )}
           </button>
         </div>
 
@@ -996,17 +1001,16 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                 <Key className="w-3.5 h-3.5 text-amber-400" />
                 Your Gemini API key
               </label>
-
-              {/* Status Badge */}
               <div className="flex items-center gap-1.5 text-xs">
                 {activeUserApiKey ? (
                   <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 font-medium">
                     <ShieldCheck className="w-3 h-3" />
-                    Key active
+                    Your key is active
                   </span>
                 ) : (
-                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-slate-800/80 border border-slate-700/60 text-slate-400 font-medium">
-                    No key active
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-amber-500/10 border border-amber-500/30 text-amber-400 font-medium">
+                    <AlertCircle className="w-3 h-3" />
+                    No API key added
                   </span>
                 )}
               </div>
@@ -1036,26 +1040,24 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                   )}
                 </button>
               </div>
-
               <div className="flex items-center gap-2">
                 <button
                   type="button"
                   onClick={handleApplyKey}
-                  className="px-3.5 py-2 rounded-lg text-xs font-semibold bg-amber-400 hover:bg-amber-300 text-slate-950 transition-colors"
+                  className="px-3.5 py-2 rounded-lg text-xs font-semibold bg-amber-400 hover:bg-amber-300 text-slate-950 transition-colors cursor-pointer"
                 >
                   Apply Key
                 </button>
                 <button
                   type="button"
                   onClick={handleClearKey}
-                  className="px-3 py-2 rounded-lg text-xs font-medium text-slate-400 hover:text-slate-200 bg-slate-800/80 hover:bg-slate-800 transition-colors border border-slate-700/50"
+                  className="px-3 py-2 rounded-lg text-xs font-medium text-slate-400 hover:text-slate-200 bg-slate-800/80 hover:bg-slate-800 transition-colors border border-slate-700/50 cursor-pointer"
                 >
                   Clear Key
                 </button>
               </div>
             </div>
 
-            {/* Remember key checkbox, how to get free key link, and privacy note */}
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-1 text-[11px] text-slate-400">
               <div className="flex items-center gap-2">
                 <input
@@ -1072,7 +1074,6 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                   Remember on this device
                 </label>
               </div>
-
               <div className="flex items-center gap-2 text-[11px] flex-wrap">
                 <a
                   href="https://aistudio.google.com/apikey"
@@ -1093,11 +1094,9 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
           {/* TAB 1: VOICE STUDIO */}
           {activeTab === "studio" && (
             <>
-              {/* Controls Group: Language, Accent, Style, Pace, Model, Mode */}
+              {/* Controls Group */}
               <div className="space-y-4 bg-[#0a0e1a]/60 border border-slate-800/70 rounded-xl p-4">
-                {/* Row 1: Language & Accent & Style & Pace */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-                  {/* Language */}
                   <div className="space-y-1.5">
                     <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
                       Language
@@ -1116,7 +1115,6 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                     </select>
                   </div>
 
-                  {/* Accent */}
                   <div className="space-y-1.5">
                     <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
                       Accent
@@ -1137,7 +1135,6 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                     </select>
                   </div>
 
-                  {/* Voice Style */}
                   <div className="space-y-1.5">
                     <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
                       Voice Style
@@ -1156,7 +1153,6 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                     </select>
                   </div>
 
-                  {/* Pace */}
                   <div className="space-y-1.5">
                     <label className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
                       Pace
@@ -1176,9 +1172,7 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                   </div>
                 </div>
 
-                {/* Row 2: Mode Toggle & Model */}
                 <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800/60">
-                  {/* Mode Toggle */}
                   <div className="flex items-center gap-2">
                     <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
                       Mode:
@@ -1187,7 +1181,7 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                       <button
                         type="button"
                         onClick={() => setIsTwoSpeaker(false)}
-                        className={`px-3 py-1 rounded-md transition-all font-medium ${
+                        className={`px-3 py-1 rounded-md transition-all font-medium cursor-pointer ${
                           !isTwoSpeaker
                             ? "bg-amber-400 text-slate-950"
                             : "text-slate-400 hover:text-slate-200"
@@ -1198,7 +1192,7 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                       <button
                         type="button"
                         onClick={() => setIsTwoSpeaker(true)}
-                        className={`px-3 py-1 rounded-md transition-all font-medium ${
+                        className={`px-3 py-1 rounded-md transition-all font-medium cursor-pointer ${
                           isTwoSpeaker
                             ? "bg-amber-400 text-slate-950"
                             : "text-slate-400 hover:text-slate-200"
@@ -1209,7 +1203,6 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                     </div>
                   </div>
 
-                  {/* Model Dropdown */}
                   <div className="flex flex-col items-start sm:items-end gap-1">
                     <div className="flex items-center gap-2">
                       <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
@@ -1228,15 +1221,10 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                         ))}
                       </select>
                     </div>
-                    <span className="text-[10px] text-slate-500">
-                      Pro models may need billing enabled on your Google API key.
-                    </span>
                   </div>
                 </div>
 
-                {/* Row 3: Wait Between Chunks & Chunk Size */}
                 <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800/60">
-                  {/* Wait between chunks */}
                   <div className="flex items-center gap-2">
                     <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
                       Wait between chunks:
@@ -1252,7 +1240,6 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                     </select>
                   </div>
 
-                  {/* Chunk size */}
                   <div className="flex flex-col items-start sm:items-end gap-1">
                     <div className="flex items-center gap-2">
                       <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
@@ -1269,13 +1256,10 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                         <option value={2500}>2500 characters</option>
                       </select>
                     </div>
-                    <span className="text-[10px] text-slate-500">
-                      Bigger chunks use fewer requests, which helps on the free tier.
-                    </span>
                   </div>
                 </div>
 
-                {/* Row 3: Voices and Preview */}
+                {/* Voice Selection */}
                 {!isTwoSpeaker ? (
                   <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end pt-1">
                     <div className="sm:col-span-8 space-y-1.5">
@@ -1298,7 +1282,6 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                             </option>
                           ))}
                         </select>
-
                         <div className="flex items-center gap-1.5 shrink-0">
                           <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
                             Gender:
@@ -1320,13 +1303,13 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                         </div>
                       </div>
                     </div>
-
                     <div className="sm:col-span-4 flex flex-col items-end gap-1">
                       <button
                         type="button"
                         onClick={() => handlePlayPreview(1)}
-                        disabled={isGenerating || isPreviewLoading}
-                        className={`w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold transition-all ${
+                        disabled={isGenerating || isPreviewLoading || !isKeyAvailable}
+                        title={!isKeyAvailable ? "Please add your own Gemini API key to continue." : undefined}
+                        className={`w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
                           isPreviewPlaying
                             ? "bg-amber-400 text-slate-950 font-bold"
                             : "bg-slate-800 text-amber-300 hover:bg-slate-700 border border-amber-500/30"
@@ -1349,13 +1332,9 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                           </>
                         )}
                       </button>
-                      <span className="text-[10px] text-slate-500">
-                        Uses 1 request.
-                      </span>
                     </div>
                   </div>
                 ) : (
-                  /* Two-Speaker Mode Voice Controls */
                   <div className="space-y-3 pt-1">
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       {/* Speaker 1 */}
@@ -1468,14 +1447,12 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                     </div>
 
                     <div className="flex flex-wrap items-center justify-end gap-2">
-                      <span className="text-[10px] text-slate-500">
-                        Uses 1 request each.
-                      </span>
                       <button
                         type="button"
                         onClick={() => handlePlayPreview(1)}
-                        disabled={isGenerating || isPreviewLoading}
-                        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                        disabled={isGenerating || isPreviewLoading || !isKeyAvailable}
+                        title={!isKeyAvailable ? "Please add your own Gemini API key to continue." : undefined}
+                        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
                           isPreviewPlaying && previewSpeakerNum === 1
                             ? "bg-amber-400 text-slate-950 font-bold"
                             : "bg-slate-800 text-amber-300 hover:bg-slate-700 border border-amber-500/30"
@@ -1498,12 +1475,12 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                           </>
                         )}
                       </button>
-
                       <button
                         type="button"
                         onClick={() => handlePlayPreview(2)}
-                        disabled={isGenerating || isPreviewLoading}
-                        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                        disabled={isGenerating || isPreviewLoading || !isKeyAvailable}
+                        title={!isKeyAvailable ? "Please add your own Gemini API key to continue." : undefined}
+                        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
                           isPreviewPlaying && previewSpeakerNum === 2
                             ? "bg-amber-400 text-slate-950 font-bold"
                             : "bg-slate-800 text-amber-300 hover:bg-slate-700 border border-amber-500/30"
@@ -1538,20 +1515,16 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                     <FileText className="w-3.5 h-3.5 text-amber-400" />
                     Script to Narrate
                   </label>
-
                   <div className="flex items-center gap-3 text-xs">
-                    {/* Clear saved progress button */}
                     <button
                       type="button"
                       onClick={handleClearSavedProgress}
                       disabled={isGenerating}
-                      className="text-slate-400 hover:text-amber-300 underline underline-offset-2 transition-colors disabled:opacity-50"
+                      className="text-slate-400 hover:text-amber-300 underline underline-offset-2 transition-colors disabled:opacity-50 cursor-pointer"
                       title="Clear stored chunk audio from browser IndexedDB"
                     >
                       Clear saved progress{savedProgressCount > 0 ? ` (${savedProgressCount})` : ""}
                     </button>
-
-                    {/* Upload .txt script button */}
                     <input
                       ref={fileInputRef}
                       type="file"
@@ -1563,27 +1536,25 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                       type="button"
                       onClick={() => fileInputRef.current?.click()}
                       disabled={isGenerating}
-                      className="inline-flex items-center gap-1 text-amber-400 hover:text-amber-300 underline underline-offset-2 transition-colors disabled:opacity-50"
+                      className="inline-flex items-center gap-1 text-amber-400 hover:text-amber-300 underline underline-offset-2 transition-colors disabled:opacity-50 cursor-pointer"
                     >
                       <Upload className="w-3 h-3" />
                       Upload .txt script
                     </button>
-
                     <button
                       type="button"
                       onClick={handleLoadSample}
                       disabled={isGenerating}
-                      className="text-slate-400 hover:text-slate-200 transition-colors disabled:opacity-50"
+                      className="text-slate-400 hover:text-slate-200 transition-colors disabled:opacity-50 cursor-pointer"
                     >
                       Sample
                     </button>
-
                     {scriptText && (
                       <button
                         type="button"
                         onClick={() => setScriptText("")}
                         disabled={isGenerating}
-                        className="text-slate-500 hover:text-slate-300 transition-colors disabled:opacity-50"
+                        className="text-slate-500 hover:text-slate-300 transition-colors disabled:opacity-50 cursor-pointer"
                       >
                         Clear
                       </button>
@@ -1604,7 +1575,6 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                   className="w-full bg-[#0a0e1a] border border-slate-800 rounded-xl p-3.5 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-amber-500/60 focus:ring-1 focus:ring-amber-500/50 leading-relaxed resize-y min-h-[200px]"
                 />
 
-                {/* Live Stats */}
                 <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400 pt-1 border-t border-slate-800/60">
                   <div className="flex items-center gap-3">
                     <span className="font-mono text-slate-300">
@@ -1616,7 +1586,6 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                       <span className="text-slate-400">words</span>
                     </span>
                   </div>
-
                   <div className="flex items-center gap-3">
                     <div className="flex items-center gap-1 text-slate-400">
                       <Layers className="w-3.5 h-3.5 text-amber-400/80" />
@@ -1634,13 +1603,14 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                 </div>
               </div>
 
-              {/* Section 4: Action Buttons (Generate / Stop) */}
+              {/* Action Buttons (Generate / Stop) */}
               <div className="pt-1 flex items-center gap-3">
                 <button
                   type="button"
                   onClick={handleGenerateVoiceover}
-                  disabled={isGenerating || !scriptText.trim()}
-                  className="flex-1 py-3.5 px-6 rounded-xl font-bold text-slate-950 bg-gradient-to-r from-amber-400 via-amber-300 to-amber-400 hover:from-amber-300 hover:to-amber-200 transition-all shadow-lg shadow-amber-500/20 hover:shadow-amber-500/30 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 text-sm sm:text-base tracking-wide"
+                  disabled={isGenerating || !scriptText.trim() || !isKeyAvailable}
+                  title={!isKeyAvailable ? "Please add your own Gemini API key to continue." : undefined}
+                  className="flex-1 py-3.5 px-6 rounded-xl font-bold text-slate-950 bg-gradient-to-r from-amber-400 via-amber-300 to-amber-400 hover:from-amber-300 hover:to-amber-200 transition-all shadow-lg shadow-amber-500/20 hover:shadow-amber-500/30 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 text-sm sm:text-base tracking-wide cursor-pointer"
                 >
                   {isGenerating ? (
                     <>
@@ -1654,13 +1624,11 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                     </>
                   )}
                 </button>
-
-                {/* Stop Button while running */}
                 {isGenerating && (
                   <button
                     type="button"
                     onClick={handleStopGeneration}
-                    className="py-3.5 px-5 rounded-xl font-semibold text-rose-300 bg-rose-950/80 hover:bg-rose-900 border border-rose-800 transition-colors text-sm flex items-center gap-1.5"
+                    className="py-3.5 px-5 rounded-xl font-semibold text-rose-300 bg-rose-950/80 hover:bg-rose-900 border border-rose-800 transition-colors text-sm flex items-center gap-1.5 cursor-pointer"
                   >
                     <Square className="w-4 h-4 fill-current" />
                     <span>Stop</span>
@@ -1688,11 +1656,30 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                 </div>
               )}
 
-              {/* Plain Line Error Message (Strict requirement: ONE plain line) */}
+              {/* Error Message with Upgrade Button for Quota */}
               {errorMessage && (
-                <p className="text-red-400 text-xs sm:text-sm font-medium pt-1">
-                  {errorMessage}
-                </p>
+                <div
+                  className={`p-3.5 rounded-xl border flex items-center justify-between gap-3 text-xs sm:text-sm animate-in fade-in ${
+                    errorMessage.includes("Free limit reached")
+                      ? "bg-amber-500/15 border-amber-500/50 text-amber-200"
+                      : "bg-red-500/10 border-red-500/30 text-red-400"
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4 shrink-0 text-amber-400" />
+                    <span className="font-semibold">{errorMessage}</span>
+                  </div>
+                  {errorMessage.includes("Free limit reached") && (
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab("account")}
+                      className="px-3.5 py-1.5 rounded-lg text-xs font-bold bg-amber-400 hover:bg-amber-300 text-slate-950 shadow-md shadow-amber-500/20 cursor-pointer transition-all shrink-0 flex items-center gap-1.5"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                      <span>Upgrade</span>
+                    </button>
+                  )}
+                </div>
               )}
 
               {/* Audio Player and Download */}
@@ -1709,18 +1696,16 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                       Merged continuous 16-bit PCM WAV
                     </span>
                   </div>
-
                   <audio
                     controls
                     src={generatedAudioUrl}
                     className="w-full accent-amber-500 h-10 rounded-lg"
                   />
-
                   <div className="flex justify-end pt-1">
                     <a
                       href={generatedAudioUrl}
                       download="sm-voice-studio-voiceover.wav"
-                      className="inline-flex items-center justify-center gap-2 px-5 py-2 rounded-xl text-xs sm:text-sm font-semibold bg-amber-400 hover:bg-amber-300 text-slate-950 shadow-md shadow-amber-500/10 transition-all"
+                      className="inline-flex items-center justify-center gap-2 px-5 py-2 rounded-xl text-xs sm:text-sm font-semibold bg-amber-400 hover:bg-amber-300 text-slate-950 shadow-md shadow-amber-500/10 transition-all cursor-pointer"
                     >
                       <Download className="w-4 h-4" />
                       Download Audio (.wav)
@@ -1734,7 +1719,6 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
           {/* TAB 2: TRANSLATE & DUB */}
           {activeTab === "translate" && (
             <div className="space-y-5">
-              {/* Input Mode Switch */}
               <div className="flex items-center gap-4 text-xs">
                 <span className="text-slate-400 uppercase tracking-wider font-semibold">
                   Source:
@@ -1761,7 +1745,6 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                 </label>
               </div>
 
-              {/* Source Input */}
               {translateMode === "text" ? (
                 <div className="space-y-1.5">
                   <label className="text-xs font-semibold uppercase tracking-wider text-slate-400">
@@ -1801,14 +1784,12 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                         : "Click to choose audio file (up to ~20MB)"}
                     </p>
                     <p className="text-[11px] text-slate-500 mt-1">
-                      Gemini 3.6 Flash will transcribe word for word with
-                      punctuation, then translate.
+                      Gemini will transcribe word for word with punctuation, then translate.
                     </p>
                   </div>
                 </div>
               )}
 
-              {/* Target Language Selection */}
               <div className="flex flex-wrap items-center justify-between gap-3 bg-[#0a0e1a] border border-slate-800 rounded-xl p-3">
                 <div className="flex items-center gap-2">
                   <Languages className="w-4 h-4 text-amber-400" />
@@ -1827,12 +1808,12 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                     ))}
                   </select>
                 </div>
-
                 <button
                   type="button"
                   onClick={handleTranslateAndDub}
-                  disabled={isTranslating}
-                  className="px-5 py-2 rounded-xl text-xs sm:text-sm font-semibold bg-amber-400 hover:bg-amber-300 text-slate-950 transition-all disabled:opacity-50 flex items-center gap-2"
+                  disabled={isTranslating || !isKeyAvailable}
+                  title={!isKeyAvailable ? "Please add your own Gemini API key to continue." : undefined}
+                  className="px-5 py-2 rounded-xl text-xs sm:text-sm font-semibold bg-amber-400 hover:bg-amber-300 text-slate-950 transition-all disabled:opacity-50 flex items-center gap-2 cursor-pointer"
                 >
                   {isTranslating ? (
                     <>
@@ -1845,14 +1826,31 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                 </button>
               </div>
 
-              {/* Error line */}
               {errorMessage && (
-                <p className="text-red-400 text-xs sm:text-sm font-medium">
-                  {errorMessage}
-                </p>
+                <div
+                  className={`p-3.5 rounded-xl border flex items-center justify-between gap-3 text-xs sm:text-sm animate-in fade-in ${
+                    errorMessage.includes("Free limit reached")
+                      ? "bg-amber-500/15 border-amber-500/50 text-amber-200"
+                      : "bg-red-500/10 border-red-500/30 text-red-400"
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4 shrink-0 text-amber-400" />
+                    <span className="font-semibold">{errorMessage}</span>
+                  </div>
+                  {errorMessage.includes("Free limit reached") && (
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab("account")}
+                      className="px-3.5 py-1.5 rounded-lg text-xs font-bold bg-amber-400 hover:bg-amber-300 text-slate-950 shadow-md shadow-amber-500/20 cursor-pointer transition-all shrink-0 flex items-center gap-1.5"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                      <span>Upgrade</span>
+                    </button>
+                  )}
+                </div>
               )}
 
-              {/* Translated Output Box */}
               {translatedResultText && (
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
@@ -1862,13 +1860,12 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                     <button
                       type="button"
                       onClick={handleUseInVoiceover}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 text-slate-950 transition-colors shadow-sm"
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 text-slate-950 transition-colors shadow-sm cursor-pointer"
                     >
                       <span>Use in Voiceover</span>
                       <ArrowRight className="w-3.5 h-3.5" />
                     </button>
                   </div>
-
                   <textarea
                     value={translatedResultText}
                     onChange={(e) => setTranslatedResultText(e.target.value)}
@@ -1878,19 +1875,117 @@ Speaker2: [in awe] In all my fifty years, I have never witnessed a migration of 
                 </div>
               )}
 
-              {/* Honest Note as requested */}
               <div className="text-[11px] text-slate-500 italic bg-[#0a0e1a]/40 border border-slate-800/60 rounded-lg p-3">
-                Note: The dubbed voiceover is not timed to match the original
-                audio or video.
+                Note: The dubbed voiceover is not timed to match the original audio or video.
               </div>
+            </div>
+          )}
+
+          {/* TAB 3: PRICING & ACCOUNT */}
+          {activeTab === "account" && (
+            <div className="space-y-6">
+              {/* Account Quick Details */}
+              <div className="bg-[#0a0e1a] border border-slate-800 rounded-2xl p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div>
+                  <span className="text-[11px] uppercase font-semibold tracking-wider text-slate-400">
+                    Signed in Account
+                  </span>
+                  <p className="text-sm sm:text-base font-bold text-slate-100 mt-0.5">
+                    {currentUser?.email || "Studio Member"}
+                  </p>
+                  <p className="text-[11px] font-mono text-slate-400 mt-0.5 break-all">
+                    UID: {currentUser?.uid}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (currentUser?.uid) {
+                      navigator.clipboard.writeText(currentUser.uid);
+                    }
+                  }}
+                  className="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold transition-colors self-start sm:self-center shrink-0 cursor-pointer"
+                >
+                  Copy UID
+                </button>
+              </div>
+
+              {/* 1. Redeem License Key */}
+              <RedeemLicenseCard
+                currentUser={currentUser}
+                onRedeemSuccess={(newPlan, newExpiresAt) => {
+                  setUserProfile((prev) =>
+                    prev
+                      ? {
+                          ...prev,
+                          plan: newPlan as any,
+                          planExpiresAt: newExpiresAt,
+                        }
+                      : null
+                  );
+                }}
+              />
+
+              {/* 2. Pricing Plans Section */}
+              <PricingSection
+                pricing={pricingSettings}
+                userProfile={userProfile}
+                onBuyNow={(plan, priceUSD, pricePKR) => {
+                  setSelectedPlanForPayment(plan);
+                  setSelectedPriceUSD(priceUSD);
+                  setSelectedPricePKR(pricePKR);
+                  setIsPaymentModalOpen(true);
+                }}
+              />
+
+              {/* 3. My Payments Status List */}
+              <PaymentRequestsList requests={userPaymentRequests} />
+
+              {/* 4. Admin Payment Approval & License Key Generator */}
+              <AdminPaymentPanel currentUser={currentUser} />
             </div>
           )}
         </main>
       </div>
 
-      {/* Developer Credit 2: Subtle, always-visible footer centered at bottom */}
+      {/* Manual Payment Verification Modal */}
+      <ManualPaymentModal
+        isOpen={isPaymentModalOpen}
+        onClose={() => setIsPaymentModalOpen(false)}
+        selectedPlan={selectedPlanForPayment}
+        priceUSD={selectedPriceUSD}
+        pricePKR={selectedPricePKR}
+        paymentMethods={paymentMethods}
+        currentUser={currentUser}
+        onPaymentSubmitted={() => {}}
+      />
+
+      {/* Upgrade Subscription Modal */}
+      <UpgradeModal
+        isOpen={isUpgradeModalOpen}
+        onClose={() => setIsUpgradeModalOpen(false)}
+        userProfile={userProfile}
+        uid={currentUser?.uid}
+        onChoosePlan={(plan) => {
+          setSelectedPlanForPayment(plan);
+          const rate = pricingSettings.exchangeRatePKR || 280;
+          const usd =
+            plan === "threeday"
+              ? pricingSettings.threedayUSD
+              : plan === "lifetime"
+              ? pricingSettings.lifetimeUSD
+              : plan === "quarterly"
+              ? pricingSettings.quarterlyUSD
+              : pricingSettings.monthlyUSD;
+          setSelectedPriceUSD(usd);
+          setSelectedPricePKR(Math.round(usd * rate));
+          setIsPaymentModalOpen(true);
+        }}
+      />
+
+      {/* Developer Credit 2 */}
       <footer className="relative z-10 py-4 text-center text-xs tracking-wider text-amber-500/70 border-t border-slate-800/80 bg-[#090d16]/90">
-        © Developed by SHANI MUGHAL
+        Developed by SHANI MUGHAL
       </footer>
     </div>
   );

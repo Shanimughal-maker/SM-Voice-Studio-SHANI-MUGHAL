@@ -1,4 +1,9 @@
 /**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/**
  * IndexedDB storage for finished audio chunks to support resuming generation.
  * Keyed by a SHA-256 hash of:
  * chunk text + voice + model + style + language + accent + pace.

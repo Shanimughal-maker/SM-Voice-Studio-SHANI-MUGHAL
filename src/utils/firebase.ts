@@ -133,10 +133,16 @@ export interface UserProfile {
   createdAt: any;
 }
 
+// Convert Firestore Timestamps (and {seconds, nanoseconds} objects) into ISO date strings
+// so the UI never receives a raw Timestamp object.
 function tsToIso(v: any): any {
   if (v && typeof v === "object") {
     if (typeof v.toDate === "function") {
-      try { return v.toDate().toISOString(); } catch { return null; }
+      try {
+        return v.toDate().toISOString();
+      } catch {
+        return null;
+      }
     }
     if (typeof v.seconds === "number") {
       return new Date(v.seconds * 1000).toISOString();
@@ -164,6 +170,7 @@ export async function ensureUserProfile(user: User): Promise<UserProfile> {
   const promise = (async () => {
     const userDocRef = doc(db, "users", user.uid);
     const path = `users/${user.uid}`;
+
     let snap;
     try {
       snap = await getDoc(userDocRef);
@@ -210,6 +217,7 @@ export function subscribeUserProfile(
 ): Unsubscribe {
   const userDocRef = doc(db, "users", uid);
   const path = `users/${uid}`;
+
   return onSnapshot(
     userDocRef,
     (snap) => {
@@ -244,9 +252,11 @@ export async function recordServerUsage(
         charactersCount,
       }),
     });
+
     if (!res.ok) {
       throw new Error(`Usage recording failed with status ${res.status}`);
     }
+
     return await res.json();
   } catch (err) {
     console.warn("Could not record server usage:", err);
@@ -407,6 +417,7 @@ export function subscribePaymentRequests(
     },
     (err) => {
       console.warn("Payment requests snapshot warning:", err);
+      // Fallback query without orderBy if index is still building
       try {
         const simpleQ = query(reqCol, where("uid", "==", uid));
         return onSnapshot(simpleQ, (s2) => {
@@ -521,6 +532,7 @@ export function subscribePaymentMethods(
 }
 
 // Live real-time subscription for ALL payment requests (for Admin Panel)
+// Sorts pending requests first, then newest first
 export function subscribeAllPaymentRequests(
   onUpdate: (requests: PaymentRequest[]) => void,
   onError?: (err: any) => void
@@ -533,11 +545,14 @@ export function subscribeAllPaymentRequests(
         id: docSnap.id,
         ...normalizeDates<Omit<PaymentRequest, "id">>(docSnap.data()),
       }));
+
+      // Sort pending first, then by createdAt desc
       items.sort((a, b) => {
         if (a.status === "pending" && b.status !== "pending") return -1;
         if (a.status !== "pending" && b.status === "pending") return 1;
         return (b.createdAt || "").localeCompare(a.createdAt || "");
       });
+
       onUpdate(items);
     },
     (err) => {
@@ -554,9 +569,11 @@ export async function savePaymentSettingsToFirestore(
   idToken?: string,
   passcode?: string
 ): Promise<void> {
+  // Try direct Firestore client write first if admin
   try {
     const methodsRef = doc(db, "settings", "paymentMethods");
     await setDoc(methodsRef, { methods }, { merge: true });
+
     const pricingRef = doc(db, "settings", "pricing");
     await setDoc(pricingRef, pricing, { merge: true });
     return;
@@ -574,6 +591,7 @@ export async function savePaymentSettingsToFirestore(
     },
     body: JSON.stringify({ methods, pricing }),
   });
+
   if (!res.ok) {
     const errData = await res.json().catch(() => ({}));
     throw new Error(errData.error || "Failed to save settings.");
@@ -588,3 +606,4 @@ export {
   onAuthStateChanged,
   type User,
 };
+
